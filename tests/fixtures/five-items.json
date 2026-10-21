@@ -1,0 +1,14 @@
+{
+  "units": {"length": "mm"},
+  "configuration": {"solver_profile": "balanced", "time_limit_ms": 300000, "effort_budget": {"max_candidates_evaluated": 1000000, "max_placement_attempts": 1000000, "max_search_nodes": 1000000}},
+  "items": [
+    {"id": "test1", "quantity": 1, "dimensions": {"length": "9", "width": "8", "height": "7"}, "weight": {"value": "1", "unit": "g"}},
+    {"id": "test2", "quantity": 1, "dimensions": {"length": "4", "width": "25", "height": "1"}, "weight": {"value": "1", "unit": "g"}},
+    {"id": "test3", "quantity": 1, "dimensions": {"length": "2", "width": "13", "height": "5"}, "weight": {"value": "1", "unit": "g"}},
+    {"id": "test4", "quantity": 1, "dimensions": {"length": "7", "width": "5", "height": "4"}, "weight": {"value": "1", "unit": "g"}},
+    {"id": "test5", "quantity": 1, "dimensions": {"length": "10", "width": "5", "height": "2"}, "weight": {"value": "1", "unit": "g"}}
+  ],
+  "containers": [
+    {"id": "box", "inner_dimensions": {"length": "30", "width": "10", "height": "15"}, "max_payload": {"value": "99", "unit": "g"}}
+  ]
+}

@@ -1,0 +1,5033 @@
+use std::rc::Rc;
+
+use crate::contact_graph::{ContactEdge, ContactGraph};
+use crate::deadline::Deadline;
+use crate::geometry::{self, Aabb, Dimensions, Point, Rotation, ShapeType};
+use crate::hull::{self, HullShape};
+use crate::made_to_measure::sides_of;
+use crate::model::*;
+use crate::solver::{CandidateScorer, PlacementConstraint, SolverContext};
+use crate::spatial_index::SpatialIndex;
+use crate::units::{Length, Weight};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::sync::Arc;
+
+#[derive(Clone, Debug)]
+pub struct Candidate {
+    pub envelope_origin: Point,
+    pub position: Point,
+    pub rotation: Rotation,
+    pub dimensions: Dimensions,
+    pub envelope_dimensions: Dimensions,
+    pub support_ratio: f64,
+    /// Sum of the registered `CandidateScorer`s, `0` when none is registered. It leads the
+    /// ranking; the built-in far-corner key only breaks its ties.
+    pub score: i128,
+}
+
+type CandidateOrderKey = (i128, i64, i64, i64, i64, i64, i64, &'static str);
+
+/// Lower ranks first: scorer sum, then the envelope's far corner `z2`, `y2`, `x2`, then
+/// its origin `z`, `y`, `x` and the rotation name. Compared as a tuple, never folded into
+/// one weighted integer: in ticks a long container's `x2` outweighs a 1 mm step in `y2`
+/// under any fixed weights.
+fn candidate_order_key(candidate: &Candidate) -> CandidateOrderKey {
+    let origin = candidate.envelope_origin;
+    let envelope = candidate.envelope_dimensions;
+    (
+        candidate.score,
+        origin.z + envelope.height.0,
+        origin.y + envelope.width.0,
+        origin.x + envelope.length.0,
+        origin.z,
+        origin.y,
+        origin.x,
+        candidate.rotation.as_str(),
+    )
+}
+
+struct RankedCandidate {
+    key: CandidateOrderKey,
+    ordinal: usize,
+    candidate: Candidate,
+}
+
+impl PartialEq for RankedCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        (self.key, self.ordinal) == (other.key, other.ordinal)
+    }
+}
+
+impl Eq for RankedCandidate {}
+
+impl PartialOrd for RankedCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.key, self.ordinal).cmp(&(other.key, other.ordinal))
+    }
+}
+
+enum CandidateAccumulator {
+    All(Vec<Candidate>),
+    Bounded {
+        limit: usize,
+        next_ordinal: usize,
+        worst_first: BinaryHeap<RankedCandidate>,
+    },
+}
+
+impl CandidateAccumulator {
+    fn new(limit: usize) -> Self {
+        if limit == usize::MAX {
+            Self::All(Vec::new())
+        } else {
+            Self::Bounded {
+                limit: limit.max(1),
+                next_ordinal: 0,
+                worst_first: BinaryHeap::new(),
+            }
+        }
+    }
+
+    fn push(&mut self, candidate: Candidate) {
+        match self {
+            Self::All(candidates) => candidates.push(candidate),
+            Self::Bounded {
+                limit,
+                next_ordinal,
+                worst_first,
+            } => {
+                let ranked = RankedCandidate {
+                    key: candidate_order_key(&candidate),
+                    ordinal: *next_ordinal,
+                    candidate,
+                };
+                *next_ordinal = next_ordinal
+                    .checked_add(1)
+                    .expect("candidate ordinal cannot exceed addressable memory");
+                if worst_first.len() < *limit {
+                    worst_first.push(ranked);
+                } else if let Some(mut worst) = worst_first.peek_mut()
+                    && ranked.cmp(&worst) == Ordering::Less
+                {
+                    *worst = ranked;
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<Candidate> {
+        match self {
+            Self::All(mut candidates) => {
+                candidates.sort_by_key(candidate_order_key);
+                candidates
+            }
+            Self::Bounded { worst_first, .. } => {
+                let mut ranked = worst_first.into_vec();
+                ranked.sort();
+                ranked
+                    .into_iter()
+                    .map(|candidate| candidate.candidate)
+                    .collect()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ContainerState {
+    pub packed: PackedContainer,
+    pub payload: i64,
+    used_volume: i128,
+    stack_sensitive: bool,
+    route_sensitive: bool,
+    compression_sensitive: bool,
+    /// Largest envelope `x2`, `y2` and `z2` so far: a flat bag's running extents.
+    extent: [i64; 3],
+    /// Candidate origins ordered by (z, y, x), matching the reference engines.
+    points: BTreeSet<(i64, i64, i64)>,
+    spatial_index: SpatialIndex,
+}
+
+struct ContainerTrial {
+    state: ContainerState,
+    remaining: Vec<ItemInstance>,
+    /// Ranking terms in the same order `score_solution` ranks the finished result by,
+    /// then the container id so the choice is total and deterministic.
+    ordering_key: (Vec<i128>, String),
+}
+
+impl ContainerState {
+    pub fn new(mut container: Container, sequence: usize) -> Self {
+        // Fixed items enter as real placements, so payload, support, top load and every
+        // other rule that reads `placements` holds for them with no rule of its own. They
+        // move out of the container here, so a packed container never carries them twice.
+        let preloaded = std::mem::take(&mut container.preloaded);
+        let spatial_index = SpatialIndex::new(container.inner_dimensions);
+        let obstacle_boxes = container
+            .obstacles
+            .iter()
+            .flat_map(Obstacle::boxes)
+            .collect::<Vec<_>>();
+        let mut state = Self {
+            packed: PackedContainer {
+                container,
+                sequence,
+                placements: Vec::new(),
+                lattice_summary: None,
+                lattice_items: Vec::new(),
+            },
+            payload: 0,
+            used_volume: 0,
+            stack_sensitive: false,
+            route_sensitive: false,
+            compression_sensitive: false,
+            extent: [0, 0, 0],
+            points: BTreeSet::new(),
+            spatial_index,
+        };
+        absorb_point(&mut state, Point::ZERO);
+        for box_ in obstacle_boxes {
+            for point in exposed_points(&state, box_) {
+                absorb_point(&mut state, point);
+            }
+        }
+        for placement in preloaded {
+            commit_placement(&mut state, placement);
+        }
+        state
+    }
+}
+
+/// Which candidate points a search scans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointSet {
+    /// The exposed corners and their projections, as Python and PHP keep them: every point
+    /// has a geometric reason to exist. The extreme-point family searches these. Offering
+    /// it the Cartesian set left 3658 items out over the 67 BR1-BR7 instances under `fast`,
+    /// against 2711 here and 3004 in Python; a denser set lets the greedy rule take a locally
+    /// tighter corner that a later item then cannot use.
+    Sparse,
+    /// Under a limit above `SPARSE_POINT_LIMIT`, every combination of placed faces: the
+    /// discrete model the exact search claims to be exact within.
+    Cartesian,
+}
+
+/// At or below this `max_candidate_points` every search scans the sparse set: the Cartesian
+/// product would spend most of a tight allowance on arbitrary coordinate combinations.
+const SPARSE_POINT_LIMIT: usize = 64;
+
+pub fn candidate_points(state: &ContainerState, limit: usize, set: PointSet) -> Vec<Point> {
+    let limit = limit.max(1);
+    if set == PointSet::Sparse || limit <= SPARSE_POINT_LIMIT {
+        return state
+            .points
+            .iter()
+            .take(limit)
+            .map(|(z, y, x)| Point {
+                x: *x,
+                y: *y,
+                z: *z,
+            })
+            .collect();
+    }
+    legacy_candidate_points(state, limit)
+}
+
+fn legacy_candidate_points(state: &ContainerState, limit: usize) -> Vec<Point> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut xs = BTreeSet::from([0]);
+    let mut ys = BTreeSet::from([0]);
+    let mut zs = BTreeSet::from([0]);
+    for box_ in solid_boxes(state) {
+        xs.insert(box_.x2());
+        ys.insert(box_.y2());
+        zs.insert(box_.z2());
+    }
+    let boundary = state.packed.container.inner_dimensions;
+    let mut points = Vec::new();
+    'coordinates: for z in zs {
+        for y in &ys {
+            for x in &xs {
+                if points.len() >= limit {
+                    break 'coordinates;
+                }
+                if *x >= boundary.length.0 || *y >= boundary.width.0 || z >= boundary.height.0 {
+                    continue;
+                }
+                let point = Point { x: *x, y: *y, z };
+                if !point_inside_any_solid(state, point) {
+                    points.push(point);
+                }
+            }
+        }
+    }
+    points
+}
+
+// Each parameter is a distinct, independently-varying piece of search state (not
+// several related values that would naturally bundle into one struct); grouping them
+// only to satisfy the lint would add an abstraction with no caller that benefits from
+// it.
+#[allow(clippy::too_many_arguments)]
+pub fn find_candidates(
+    state: &ContainerState,
+    item: &ItemInstance,
+    request: &PackingRequest,
+    constraints: &[Arc<dyn PlacementConstraint>],
+    scorers: &[Arc<dyn CandidateScorer>],
+    limit: usize,
+    point_set: PointSet,
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+) -> Vec<Candidate> {
+    let mut points = candidate_points(state, request.config.max_candidate_points, point_set);
+    if item.item.nesting_height.is_some() {
+        let nested = nesting_points(state, item);
+        let merged = points
+            .iter()
+            .chain(nested.iter())
+            .map(|point| (point.z, point.y, point.x))
+            .collect::<BTreeSet<_>>();
+        points = merged
+            .iter()
+            .take(request.config.max_candidate_points.max(1))
+            .map(|(z, y, x)| Point {
+                x: *x,
+                y: *y,
+                z: *z,
+            })
+            .collect();
+    }
+    if state.packed.container.axles.is_some() {
+        let axle_points = axle_balanced_points(state, item, request.config.clearance);
+        append_unseen(&mut points, axle_points);
+    }
+    find_candidates_at_points(
+        state,
+        item,
+        request,
+        constraints,
+        scorers,
+        points,
+        limit,
+        deadline,
+        metrics,
+    )
+}
+
+fn nesting_points(state: &ContainerState, item: &ItemInstance) -> Vec<Point> {
+    let Some(depth) = item.item.nesting_height else {
+        return Vec::new();
+    };
+    state
+        .packed
+        .placements
+        .iter()
+        .filter(|placement| placement.instance.item.id == item.item.id)
+        .map(|placement| {
+            (
+                placement.envelope_box().z2().saturating_sub(depth.0),
+                placement.envelope_origin.y,
+                placement.envelope_origin.x,
+            )
+        })
+        .filter(|(z, _, _)| *z >= 0)
+        .collect::<BTreeSet<(i64, i64, i64)>>()
+        .into_iter()
+        .map(|(z, y, x)| Point { x, y, z })
+        .collect()
+}
+
+/// Extra floor-level candidates that seat this item on an axle's own limit.
+///
+/// Every other candidate point is derived from the container's own origin or a
+/// placed box's far face, which is complete for plain volume packing but not once
+/// axle limits are in play: the only feasible spot for an item can be floating in
+/// open floor space, away from every wall and every other box, purely to keep that
+/// item's own moment off one axle's limit (see `axle_balanced_origins`). Floor
+/// level only (z=0), since that is the one place support needs no lateral contact.
+///
+/// The origins are envelope origins: `axle_balanced_origins` is given the envelope's length,
+/// whose centre is the physical centre, so with a clearance the point still seats the item
+/// on the limit (S10). The orientations are the sweep's own, hulls included.
+fn axle_balanced_points(
+    state: &ContainerState,
+    item: &ItemInstance,
+    clearance: Length,
+) -> Vec<Point> {
+    let limit_x = state.packed.container.inner_dimensions.length.0;
+    let floor_ys: BTreeSet<i64> = {
+        let ys: BTreeSet<i64> = state
+            .points
+            .iter()
+            .filter_map(|(z, y, _)| (*z == 0).then_some(*y))
+            .collect();
+        if ys.is_empty() {
+            BTreeSet::from([0])
+        } else {
+            ys
+        }
+    };
+    let mut points = Vec::new();
+    for (_, physical) in rotation_forms(&item.item) {
+        let dx = envelope_of(physical, clearance).length.0;
+        for x in axle_balanced_origins(
+            &state.packed.container,
+            &state.packed.placements,
+            item.item.weight,
+            dx,
+        ) {
+            if x < 0 || x > limit_x - dx {
+                continue;
+            }
+            for &y in &floor_ys {
+                points.push(Point { x, y, z: 0 });
+            }
+        }
+    }
+    points
+}
+
+/// Appends the `extra` points not already offered, keeping their order (S20).
+///
+/// A repeated point is the same candidate scanned twice: it can change nothing but the
+/// counted effort. O(k log a + a log a) for `k` offered and `a` extra points.
+fn append_unseen(points: &mut Vec<Point>, extra: Vec<Point>) {
+    let key = |point: &Point| (point.x, point.y, point.z);
+    let mut fresh: BTreeSet<(i64, i64, i64)> = extra.iter().map(key).collect();
+    for point in points.iter() {
+        fresh.remove(&key(point));
+    }
+    points.extend(extra.into_iter().filter(|point| fresh.remove(&key(point))));
+}
+
+/// The orientations a candidate sweep tries.
+///
+/// A hull is not the same solid under two rotations that happen to give the same box, so
+/// `unique_rotations` -- which keys on the box -- would silently drop orientations that
+/// differ. Cuboids keep the deduplication they have always had.
+fn rotation_forms(item: &Item) -> Vec<(Rotation, Dimensions)> {
+    if item.shape_type == ShapeType::ConvexHull {
+        item.allowed_rotations
+            .iter()
+            .map(|rotation| (*rotation, item.dimensions.rotated(*rotation)))
+            .collect()
+    } else {
+        item.dimensions.unique_rotations(&item.allowed_rotations)
+    }
+}
+
+fn envelope_of(physical: Dimensions, clearance: Length) -> Dimensions {
+    if clearance.0 > 0 {
+        physical.expand(clearance)
+    } else {
+        physical
+    }
+}
+
+// Same shape and same reasoning as `find_candidates` above -- `points` is simply
+// supplied directly here instead of being derived from `state`/`request` internally,
+// not a reason to bundle the rest into a struct no caller otherwise wants.
+#[allow(clippy::too_many_arguments)]
+pub fn find_candidates_at_points(
+    state: &ContainerState,
+    item: &ItemInstance,
+    request: &PackingRequest,
+    constraints: &[Arc<dyn PlacementConstraint>],
+    scorers: &[Arc<dyn CandidateScorer>],
+    points: Vec<Point>,
+    limit: usize,
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+) -> Vec<Candidate> {
+    if !item.item.eligible_container_tags.is_empty()
+        && item
+            .item
+            .eligible_container_tags
+            .is_disjoint(&state.packed.container.tags)
+    {
+        return Vec::new();
+    }
+    if state
+        .packed
+        .container
+        .tag_limits
+        .iter()
+        .any(|(tag, limit)| {
+            item.item.tags.contains(tag)
+                && state
+                    .packed
+                    .placements
+                    .iter()
+                    .filter(|placement| placement.instance.item.tags.contains(tag))
+                    .count()
+                    >= *limit
+        })
+    {
+        return Vec::new();
+    }
+    if points.is_empty() {
+        return Vec::new();
+    }
+    if deadline.expired() || deadline.effort_stops(request, metrics) {
+        return Vec::new();
+    }
+    let boundary = Aabb {
+        origin: Point::ZERO,
+        dimensions: state.packed.container.inner_dimensions,
+    };
+    let exact_hull = item
+        .item
+        .hull_collision_is_exact(request.config.clearance.0 == 0);
+    let rotations = rotation_forms(&item.item)
+        .into_iter()
+        .map(|(rotation, physical)| {
+            let envelope = envelope_of(physical, request.config.clearance);
+            let shape = exact_hull
+                .then_some(item.item.hull_vertices.as_ref())
+                .flatten()
+                .and_then(|vertices| hull::shape_for(vertices, hull::source_axes(rotation)));
+            (rotation, physical, envelope, shape)
+        })
+        .collect::<Vec<_>>();
+    // Built once for the whole sweep: the placed scene does not move, and a hull costs
+    // `O(v^4)` to build, so rebuilding one per candidate would dominate the scan.
+    let placed_hulls: Vec<Option<Rc<HullShape>>> = state
+        .packed
+        .placements
+        .iter()
+        .map(Placement::hull_shape)
+        .collect();
+    let payload_exceeded = state
+        .packed
+        .container
+        .max_payload
+        .is_some_and(|maximum| state.payload.saturating_add(item.item.weight.0) > maximum.0);
+    let maximum_items_reached = state
+        .packed
+        .container
+        .max_items
+        .is_some_and(|maximum| state.packed.placements.len() >= maximum);
+    let item_incompatible = incompatible(state, item);
+    // The placed boxes do not move for the whole of this item's candidate sweep,
+    // so their contact graph is built once here and every candidate is appended to it
+    // instead of each rebuilding the graph from nothing.
+    //
+    // Two exclusions. The first mirrors `candidate_respects_loads`' own short circuit --
+    // no load rule is active, so no graph is ever asked for and building one would be
+    // pure cost. The second is nesting: a nesting predecessor *replaces* the face edges
+    // of everything in its column, so one new placement can rewrite edges arbitrarily far
+    // from itself and the delta is no longer local. Nesting keeps the from-scratch path.
+    let load_rules_inactive = !state.stack_sensitive
+        && !placement_stack_sensitive(&item.item)
+        && state.packed.container.max_stack_density.is_none();
+    let nesting_present = item.item.nesting_height.is_some()
+        || state
+            .packed
+            .placements
+            .iter()
+            .any(|placement| placement.instance.item.nesting_height.is_some());
+    let load_sweep = (!load_rules_inactive && !nesting_present).then(|| {
+        // The cell must cover every box hashed into the broad phase or queried against
+        // it, and the candidate is a new item that may be wider than anything placed --
+        // so the hint comes from this item's own rotations, which are known here.
+        let widest = rotations
+            .iter()
+            .map(|(_, _, envelope, _)| envelope.length.0.max(envelope.width.0))
+            .max()
+            .unwrap_or(1);
+        LoadSweep::new(state, widest)
+    });
+    // The placed scene is immutable for this whole candidate sweep. Building its open
+    // corridors once changes the hot-path accessibility check from O(m² * |D|) for every
+    // candidate to O(m * |D|), while preserving the exact same blocker predicate.
+    // The container's own doors win; the configured list is what a container that states
+    // none inherits. `access_directions` became a request field at the 1.1.0
+    // freeze and had to be a per-container one -- two doors on one trailer and none on
+    // another is the case that makes the rule worth having -- while `PackingConfig` stays
+    // as the default for the library callers who set the doors in code.
+    // A flat bag has no walls, so it inherits no doors either.
+    let doors: &[String] = if state.packed.container.is_flat_bag() {
+        &[]
+    } else if state.packed.container.access_directions.is_empty() {
+        &request.config.access_directions
+    } else {
+        &state.packed.container.access_directions
+    };
+    let stop_accessibility_base = ((state.route_sensitive || item.item.stop_index.is_some())
+        && !doors.is_empty())
+    .then(|| {
+        StopAccessibilityBase::new(
+            item.item.stop_index,
+            &state.packed.placements,
+            state.packed.container.inner_dimensions,
+            doors,
+        )
+    });
+    let flat_bag = state.packed.container.is_flat_bag();
+    let mut candidates = CandidateAccumulator::new(limit);
+    for (point_index, point) in points.into_iter().enumerate() {
+        if point_index > 0 && (deadline.expired() || deadline.effort_stops(request, metrics)) {
+            break;
+        }
+        metrics.candidate_points_considered = metrics.candidate_points_considered.saturating_add(1);
+        for (rotation, physical, envelope, shape) in &rotations {
+            let (rotation, physical, envelope) = (*rotation, *physical, *envelope);
+            // Checked before each counted rotation, so neither `orientations_considered` nor
+            // `feasible_candidates` (at most one per rotation) passes its limit.
+            if deadline.effort_stops(request, metrics) {
+                break;
+            }
+            metrics.orientations_considered = metrics.orientations_considered.saturating_add(1);
+            let envelope_box = Aabb {
+                origin: point,
+                dimensions: envelope,
+            };
+            if !boundary.contains(envelope_box) {
+                continue;
+            }
+            // A flat bag also needs a + c <= L and b + c <= W over the running extents grown
+            // by the candidate: O(1), and the extents only grow, so no verdict flips.
+            if flat_bag
+                && !state
+                    .packed
+                    .container
+                    .girth_admits(grown_extent(state.extent, envelope_box))
+            {
+                continue;
+            }
+            let clearance = request.config.clearance.0;
+            let position = Point {
+                x: point.x.saturating_add(clearance),
+                y: point.y.saturating_add(clearance),
+                z: point.z.saturating_add(clearance),
+            };
+            let tentative = item.item.nesting_height.map(|_| Placement {
+                instance: item.clone(),
+                position,
+                rotation,
+                dimensions: physical,
+                envelope_origin: point,
+                envelope_dimensions: envelope,
+                support_ratio: 0.0,
+                top_load: Weight(0),
+                fixed: false,
+            });
+            let placement_collision = state.spatial_index.any_hit(envelope_box, |index| {
+                metrics.collision_checks = metrics.collision_checks.saturating_add(1);
+                let existing = &state.packed.placements[index];
+                if !envelope_box.intersects(existing.envelope_box()) {
+                    return false;
+                }
+                if tentative
+                    .as_ref()
+                    .is_some_and(|placement| valid_nesting(existing, placement))
+                {
+                    return false;
+                }
+                let blocker = placed_hulls[index].as_deref();
+                // The axis-aligned test is the broad phase and stays mandatory. Only
+                // when a hull is one of the two solids does the exact test get to
+                // overrule it, so a request of ordinary boxes never reaches here.
+                if shape.is_none() && blocker.is_none() {
+                    return true;
+                }
+                solids_collide(
+                    shape.as_deref(),
+                    envelope_box,
+                    blocker,
+                    existing.envelope_box(),
+                )
+            });
+            if placement_collision {
+                continue;
+            }
+            let obstacle_collision = state
+                .packed
+                .container
+                .obstacles
+                .iter()
+                .flat_map(Obstacle::boxes)
+                .any(|box_| {
+                    metrics.collision_checks = metrics.collision_checks.saturating_add(1);
+                    envelope_box.intersects(box_)
+                        && (shape.is_none()
+                            || solids_collide(shape.as_deref(), envelope_box, None, box_))
+                });
+            if obstacle_collision {
+                continue;
+            }
+            if payload_exceeded {
+                continue;
+            }
+            if maximum_items_reached {
+                continue;
+            }
+            if axle_overloaded(
+                &state.packed.container,
+                &state.packed.placements,
+                Some((item.item.weight, envelope_box)),
+            ) {
+                continue;
+            }
+            if item.item.must_be_on_floor && point.z != 0 {
+                continue;
+            }
+            if item_incompatible {
+                continue;
+            }
+            metrics.support_checks = metrics.support_checks.saturating_add(1);
+            let nested_support = tentative
+                .as_ref()
+                .map(|placement| placement_support_view(&state.packed.placements, placement));
+            let (support_area, support_ratio) = match nested_support.as_ref() {
+                Some(support) => (support.area, support.ratio),
+                None => {
+                    let area = supporting_area(state, envelope_box);
+                    (area, support_ratio_of(area, envelope_box))
+                }
+            };
+            let required_support = item
+                .item
+                .minimum_support_ratio
+                .max(request.config.minimum_support_ratio);
+            if !support_area_sufficient(
+                point.z,
+                support_area,
+                envelope.base_area(),
+                required_support,
+            ) {
+                continue;
+            }
+            let ground_contact_allowed = nested_support.as_ref().map_or_else(
+                || {
+                    ground_contact_allowed(
+                        item.item.ground_contact_rule.as_deref(),
+                        envelope_box,
+                        &state.packed.placements,
+                    )
+                },
+                |support| {
+                    ground_contact_allowed_from_view(
+                        item.item.ground_contact_rule.as_deref(),
+                        envelope_box.origin.z,
+                        support,
+                    )
+                },
+            );
+            if !ground_contact_allowed {
+                continue;
+            }
+            if (state.route_sensitive || item.item.stop_index.is_some())
+                && !route_contact_allowed(
+                    item.item.stop_index,
+                    envelope_box,
+                    &state.packed.placements,
+                )
+            {
+                continue;
+            }
+            if stop_accessibility_base.as_ref().is_some_and(|base| {
+                !base.allows(
+                    envelope_box,
+                    &state.packed.placements,
+                    state.packed.container.inner_dimensions,
+                    doors,
+                )
+            }) {
+                continue;
+            }
+
+            let candidate = Candidate {
+                envelope_origin: point,
+                position,
+                rotation,
+                dimensions: physical,
+                envelope_dimensions: envelope,
+                support_ratio,
+                score: 0,
+            };
+            if !candidate_respects_loads(
+                state,
+                item,
+                &candidate,
+                nested_support.as_ref(),
+                load_sweep.as_ref(),
+            ) {
+                continue;
+            }
+            if exceeds_void_fill_reserve(state, item, &candidate) {
+                continue;
+            }
+
+            let context = SolverContext {
+                request,
+                container: &state.packed.container,
+                placements: &state.packed.placements,
+            };
+            if constraints.iter().any(|constraint| {
+                !constraint
+                    .evaluate(&context, item, point, rotation, physical)
+                    .allowed
+            }) {
+                continue;
+            }
+
+            metrics.feasible_candidates = metrics.feasible_candidates.saturating_add(1);
+            let score = scorers.iter().fold(0_i128, |sum, scorer| {
+                sum.saturating_add(scorer.score(&context, item, &candidate))
+            });
+            candidates.push(Candidate { score, ..candidate });
+        }
+    }
+    candidates.finish()
+}
+
+pub fn pack_order(
+    request: &PackingRequest,
+    ordered: &[ItemInstance],
+    constraints: &[Arc<dyn PlacementConstraint>],
+    scorers: &[Arc<dyn CandidateScorer>],
+    solver_name: &str,
+    deadline: &Deadline,
+) -> PackingResult {
+    let deadline = &deadline.for_start();
+    let started = deadline.now_ns();
+    let mut metrics = SolverMetrics::default();
+    let opened = open_fixed_containers(
+        request,
+        ordered,
+        deadline,
+        &mut metrics,
+        |container, sequence, items, metrics| {
+            try_pack_into(
+                &container,
+                sequence,
+                items,
+                request,
+                constraints,
+                scorers,
+                deadline,
+                metrics,
+            )
+        },
+    );
+    let OpenedContainers {
+        mut packed,
+        mut remaining,
+        mut inventory,
+        mut sequences,
+    } = opened.clone();
+
+    if request.config.container_plan_beam_width > 1 {
+        let (planned, left) = pack_container_plans(
+            request,
+            opened,
+            constraints,
+            scorers,
+            deadline,
+            &mut metrics,
+        );
+        packed = planned;
+        remaining = left;
+    } else {
+        while !remaining.is_empty()
+            && request
+                .config
+                .max_containers
+                .map(|maximum| packed.len() < maximum)
+                .unwrap_or(true)
+            && !deadline.expired()
+        {
+            // Evaluate every eligible container type against the same
+            // `remaining` items and commit to whichever placed the most, rather than
+            // committing up front to the cheapest/smallest eligible type regardless of
+            // how few of the remaining items it can actually hold. Matches the
+            // documented `O(c * b * single_solver_cost)` multi-container-selection
+            // bound Python's `_across_containers`/PHP's `acrossContainers` already
+            // implement (docs/ALGORITHMS-AND-COMPLEXITY.md) -- this was a Rust-specific
+            // gap, not a new cost class.
+            // A round with no container to try is the search ending, not the budget stopping it.
+            let eligible = eligible_containers(request, &remaining, &inventory);
+            if eligible.is_empty() || deadline.effort_stops(request, &metrics) {
+                break;
+            }
+            let mut best: Option<ContainerTrial> = None;
+            for container in eligible {
+                if deadline.expired() {
+                    break;
+                }
+                let (state, next, _) = trial_container(
+                    &container,
+                    sequences.get(&container.id).copied().unwrap_or(0) + 1,
+                    &remaining,
+                    request,
+                    deadline,
+                    &mut metrics,
+                    |container, sequence, items, metrics| {
+                        try_pack_into(
+                            &container,
+                            sequence,
+                            items,
+                            request,
+                            constraints,
+                            scorers,
+                            deadline,
+                            metrics,
+                        )
+                    },
+                );
+                let placed = state.packed.placements.len();
+                if placed == 0 {
+                    continue;
+                }
+                let key =
+                    container_selection_key(&state, next.len(), remaining.len(), &request.config);
+                let replace = match &best {
+                    Some(best) => key < best.ordering_key,
+                    None => true,
+                };
+                if replace {
+                    best = Some(ContainerTrial {
+                        state,
+                        remaining: next,
+                        ordering_key: key,
+                    });
+                }
+            }
+            let Some(best) = best else {
+                break;
+            };
+            let ContainerTrial {
+                state,
+                remaining: next,
+                ..
+            } = best;
+            let container_id = state.packed.container.id.clone();
+            *sequences.entry(container_id.clone()).or_default() += 1;
+            decrement(&mut inventory, &container_id);
+            packed.push(state.packed);
+            remaining = next;
+        }
+    }
+
+    let timed_out = deadline.expired();
+    let effort_limited = deadline.effort_stopped();
+    let unpacked = remaining
+        .into_iter()
+        .map(|instance| {
+            let structural = explain_unfit(request, &instance);
+            let reason = if matches!(
+                structural.as_str(),
+                "no_compatible_container_dimensions" | "payload_exceeded" | "rotation_restricted"
+            ) {
+                structural
+            } else if timed_out {
+                "time_limit".into()
+            } else if effort_limited {
+                "effort_limit".into()
+            } else {
+                structural
+            };
+            UnpackedItem::new(instance, reason, Vec::new())
+        })
+        .collect::<Vec<_>>();
+    let complete = unpacked.is_empty();
+    let status = if complete {
+        PackingStatus::Feasible
+    } else if timed_out {
+        PackingStatus::TimeLimit
+    } else {
+        PackingStatus::BestFound
+    };
+    let score = score_solution(&packed, &unpacked, &request.config);
+    PackingResult {
+        status,
+        containers: packed,
+        unpacked,
+        algorithm: AlgorithmReport {
+            profile: request.config.profile.as_str().into(),
+            solver: solver_name.into(),
+            duration_ms: deadline.elapsed_ms_since(started),
+            seed: request.config.seed,
+            time_limit_reached: timed_out,
+            effort_limit_reached: effort_limited,
+            candidates_evaluated: metrics.feasible_candidates,
+            placements_attempted: metrics.orientations_considered,
+            metrics,
+        },
+        score,
+        warnings: Vec::new(),
+        alternatives: Vec::new(),
+        feasibility: None,
+        termination: None,
+        optimality: None,
+        objective: request.config.objective.clone(),
+        catalog_versions_used: Vec::new(),
+    }
+}
+
+/// One container's trial for a round, and how many single-container solves it spent.
+///
+/// A stock container is one solve of `fill`. A made-to-measure one tries each solving
+/// envelope in ascending order and keeps the first trial that places every item, already
+/// fabricated; failing that, the trial this round's own key prefers, the smaller rung on a
+/// tie. At most four solves and two trial states alive. A rung choice is a
+/// heuristic, so nothing here is ever claimed exhaustive (D13).
+pub(crate) fn trial_container<F>(
+    container: &Container,
+    sequence: usize,
+    remaining: &[ItemInstance],
+    request: &PackingRequest,
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+    mut fill: F,
+) -> (ContainerState, Vec<ItemInstance>, usize)
+where
+    F: FnMut(
+        Container,
+        usize,
+        &[ItemInstance],
+        &mut SolverMetrics,
+    ) -> (ContainerState, Vec<ItemInstance>),
+{
+    let Some(machine) = container.made_to_measure else {
+        let (state, next) = fill(container.clone(), sequence, remaining, metrics);
+        return (state, next, 1);
+    };
+    let grow = 2 * request.config.clearance.0;
+    let edges = remaining.iter().map(|instance| {
+        let size = instance.item.dimensions;
+        [
+            size.length.0 + grow,
+            size.width.0 + grow,
+            size.height.0 + grow,
+        ]
+    });
+    let rungs = machine.solving_envelopes(sides_of(container.inner_dimensions), edges);
+    let mut best: Option<ContainerTrial> = None;
+    let mut last = None;
+    let mut trials = 0;
+    for rung in rungs {
+        // Polled before every rung after the first, so the last rung finishing on its
+        // budget is not a stop: no rung was refused.
+        if trials > 0 && (deadline.expired() || deadline.effort_stops(request, metrics)) {
+            break;
+        }
+        let (state, next) = fill(container.with_envelope(rung), sequence, remaining, metrics);
+        trials += 1;
+        if state.packed.placements.is_empty() {
+            last = Some((state, next));
+        } else {
+            let state = fabricated(container, state);
+            if next.is_empty() {
+                return (state, next, trials);
+            }
+            let key = container_selection_key(&state, next.len(), remaining.len(), &request.config);
+            if best.as_ref().is_none_or(|best| key < best.ordering_key) {
+                best = Some(ContainerTrial {
+                    state,
+                    remaining: next,
+                    ordering_key: key,
+                });
+            }
+        }
+    }
+    match best {
+        Some(best) => (best.state, best.remaining, trials),
+        None => {
+            let (state, next) = last.expect("a chain tries at least the machine maximum");
+            (state, next, trials)
+        }
+    }
+}
+
+/// A rung trial as the box cut for it: the achieved extent of its placements, envelope far
+/// faces with clearance, rounded up onto the machine grid (D14). `O(p)`.
+fn fabricated(declared: &Container, mut state: ContainerState) -> ContainerState {
+    let achieved = envelope_extent(&state.packed.placements);
+    state.packed.container = declared
+        .fabricate(achieved)
+        .expect("only a made-to-measure container is fabricated");
+    state
+}
+
+/// Containers opened so far, what is left to place, and each type's inventory and count.
+///
+/// Containers are numbered per type, as every engine numbers them: a fixed placement names
+/// `<type>#<n>`, so the count must be the type's own.
+#[derive(Clone)]
+pub(crate) struct OpenedContainers {
+    pub(crate) packed: Vec<PackedContainer>,
+    pub(crate) remaining: Vec<ItemInstance>,
+    pub(crate) inventory: BTreeMap<String, Option<usize>>,
+    pub(crate) sequences: BTreeMap<String, usize>,
+}
+
+type MultiContainerPlan = OpenedContainers;
+
+/// Fill every container holding fixed items, first, and keep it whatever it gets.
+///
+/// Returns the plan every start continues from. A container that search cannot fill -- the
+/// deadline or effort budget is spent -- is kept with its fixed items alone: dropping it
+/// would drop items the request says are already loaded. `fill` is the solver's own
+/// single-container search.
+pub(crate) fn open_fixed_containers<F>(
+    request: &PackingRequest,
+    items: &[ItemInstance],
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+    mut fill: F,
+) -> OpenedContainers
+where
+    F: FnMut(
+        Container,
+        usize,
+        &[ItemInstance],
+        &mut SolverMetrics,
+    ) -> (ContainerState, Vec<ItemInstance>),
+{
+    let mut opened = OpenedContainers {
+        packed: Vec::new(),
+        remaining: items.to_vec(),
+        inventory: inventory(request),
+        sequences: request
+            .containers
+            .iter()
+            .map(|container| (container.id.clone(), 0))
+            .collect(),
+    };
+    for fixed in &request.fixed_containers {
+        let mut seeded = fixed.container.clone();
+        seeded.preloaded = fixed.placements.clone();
+        // With nothing left to place a fill is no counted work, so the budget refuses none.
+        let stops = if opened.remaining.is_empty() {
+            effort_exhausted(request, metrics)
+        } else {
+            deadline.effort_stops(request, metrics)
+        };
+        let (state, remaining) = if deadline.expired() || stops {
+            (
+                ContainerState::new(seeded, fixed.sequence),
+                opened.remaining.clone(),
+            )
+        } else {
+            fill(seeded, fixed.sequence, &opened.remaining, metrics)
+        };
+        decrement(&mut opened.inventory, &fixed.container.id);
+        opened
+            .sequences
+            .insert(fixed.container.id.clone(), fixed.sequence);
+        opened.packed.push(state.packed);
+        opened.remaining = remaining;
+    }
+    opened
+}
+
+fn multi_plan_score(
+    plan: &MultiContainerPlan,
+    remaining: &[ItemInstance],
+    config: &PackingConfig,
+) -> Vec<i128> {
+    let unpacked = remaining
+        .iter()
+        .cloned()
+        .map(|item| UnpackedItem::new(item, "search_exhausted".into(), Vec::new()))
+        .collect::<Vec<_>>();
+    score_solution(&plan.packed, &unpacked, config)
+}
+
+fn additional_container_lower_bound(plan: &MultiContainerPlan, request: &PackingRequest) -> usize {
+    let available = request
+        .containers
+        .iter()
+        .filter(|container| {
+            plan.inventory
+                .get(&container.id)
+                .copied()
+                .flatten()
+                .map(|quantity| quantity > 0)
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    if plan.remaining.is_empty() || available.is_empty() {
+        return 0;
+    }
+    let mut lower = 0_usize;
+    if plan
+        .remaining
+        .iter()
+        .all(|item| item.item.nesting_height.is_none())
+    {
+        let capacity = available
+            .iter()
+            .map(|container| container.inner_dimensions.volume())
+            .max()
+            .unwrap_or(0);
+        if capacity > 0 {
+            let required = plan
+                .remaining
+                .iter()
+                .map(|item| super::exact::occupied_item_volume(&item.item))
+                .sum::<i128>();
+            lower = lower.max(((required + capacity - 1) / capacity) as usize);
+        }
+    }
+    if available
+        .iter()
+        .all(|container| container.max_payload.is_some())
+    {
+        let capacity = available
+            .iter()
+            .filter_map(|container| container.max_payload)
+            .map(|weight| i128::from(weight.0))
+            .max()
+            .unwrap_or(0);
+        if capacity > 0 {
+            let required = plan
+                .remaining
+                .iter()
+                .map(|item| i128::from(item.item.weight.0))
+                .sum::<i128>();
+            lower = lower.max(((required + capacity - 1) / capacity) as usize);
+        }
+    }
+    lower
+}
+
+fn multi_plan_bound(
+    plan: &MultiContainerPlan,
+    request: &PackingRequest,
+) -> (Vec<i128>, Vec<String>) {
+    let mut score = multi_plan_score(plan, &[], &request.config);
+    let count_index = if request.config.objective == "default" {
+        1
+    } else {
+        2
+    };
+    score[count_index] += additional_container_lower_bound(plan, request) as i128;
+    (score, plan.remaining.iter().map(ItemInstance::id).collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pack_container_plans(
+    request: &PackingRequest,
+    initial: MultiContainerPlan,
+    constraints: &[Arc<dyn PlacementConstraint>],
+    scorers: &[Arc<dyn CandidateScorer>],
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+) -> (Vec<PackedContainer>, Vec<ItemInstance>) {
+    let mut incumbent = initial.clone();
+    let mut beam = vec![initial];
+    let mut plan_nodes = 0_usize;
+    let maximum = request.config.max_containers.unwrap_or(usize::MAX);
+
+    while !beam.is_empty() && plan_nodes < request.config.container_plan_node_limit {
+        let mut expansions = Vec::new();
+        let mut exhausted = false;
+        for plan in &beam {
+            if plan.remaining.is_empty() || plan.packed.len() >= maximum {
+                if multi_plan_score(plan, &plan.remaining, &request.config)
+                    < multi_plan_score(&incumbent, &incumbent.remaining, &request.config)
+                {
+                    incumbent = plan.clone();
+                }
+                continue;
+            }
+            for container in eligible_containers(request, &plan.remaining, &plan.inventory) {
+                if plan_nodes >= request.config.container_plan_node_limit {
+                    break;
+                }
+                if deadline.expired() || deadline.effort_stops(request, metrics) {
+                    exhausted = true;
+                    break;
+                }
+                let (state, remaining, trials) = trial_container(
+                    &container,
+                    plan.sequences.get(&container.id).copied().unwrap_or(0) + 1,
+                    &plan.remaining,
+                    request,
+                    deadline,
+                    metrics,
+                    |container, sequence, items, metrics| {
+                        try_pack_into(
+                            &container,
+                            sequence,
+                            items,
+                            request,
+                            constraints,
+                            scorers,
+                            deadline,
+                            metrics,
+                        )
+                    },
+                );
+                // Each rung is one single-container solve, so the node limit keeps bounding
+                // the work of a made-to-measure chain.
+                plan_nodes += trials;
+                if state.packed.placements.is_empty() {
+                    continue;
+                }
+                let mut child = plan.clone();
+                *child.sequences.entry(container.id.clone()).or_default() += 1;
+                child.remaining = remaining;
+                decrement(&mut child.inventory, &container.id);
+                child.packed.push(state.packed);
+                if multi_plan_score(&child, &child.remaining, &request.config)
+                    < multi_plan_score(&incumbent, &incumbent.remaining, &request.config)
+                {
+                    incumbent = child.clone();
+                }
+                expansions.push(child);
+            }
+            if exhausted {
+                break;
+            }
+        }
+        if exhausted || expansions.is_empty() {
+            break;
+        }
+        let mut dominant =
+            BTreeMap::<(Vec<String>, Vec<(String, Option<usize>)>), MultiContainerPlan>::new();
+        for plan in expansions {
+            let signature = (
+                plan.remaining.iter().map(ItemInstance::id).collect(),
+                plan.inventory
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect(),
+            );
+            let replace = dominant
+                .get(&signature)
+                .map(|previous| {
+                    multi_plan_score(&plan, &[], &request.config)
+                        < multi_plan_score(previous, &[], &request.config)
+                })
+                .unwrap_or(true);
+            if replace {
+                dominant.insert(signature, plan);
+            }
+        }
+        beam = dominant.into_values().collect();
+        beam.sort_by_key(|plan| multi_plan_bound(plan, request));
+        beam.truncate(request.config.container_plan_beam_width);
+    }
+    (incumbent.packed, incumbent.remaining)
+}
+
+pub fn apply_candidate(state: &mut ContainerState, item: ItemInstance, candidate: &Candidate) {
+    commit_placement(
+        state,
+        Placement {
+            instance: item,
+            position: candidate.position,
+            rotation: candidate.rotation,
+            dimensions: candidate.dimensions,
+            envelope_origin: candidate.envelope_origin,
+            envelope_dimensions: candidate.envelope_dimensions,
+            support_ratio: candidate.support_ratio,
+            top_load: Weight(0),
+            fixed: false,
+        },
+    );
+}
+
+/// Record one placement in the state: payload, volume, the spatial index, candidate points
+/// and top loads. A searched candidate and a fixed item go through the same bookkeeping.
+/// The running extents once `envelope` is added: three comparisons, `O(1)`.
+fn grown_extent([a, b, c]: [i64; 3], envelope: Aabb) -> [i64; 3] {
+    [
+        a.max(envelope.x2()),
+        b.max(envelope.y2()),
+        c.max(envelope.z2()),
+    ]
+}
+
+fn commit_placement(state: &mut ContainerState, placement: Placement) {
+    state.payload = state
+        .payload
+        .saturating_add(placement.instance.item.weight.0);
+    let compression_sensitive = state.compression_sensitive
+        || placement.instance.item.shape_type == ShapeType::Compressible;
+    let placement_index = state.packed.placements.len();
+    state
+        .spatial_index
+        .add(placement_index, placement.envelope_box());
+    if !compression_sensitive {
+        state.used_volume = state
+            .used_volume
+            .saturating_add(used_volume_delta(&state.packed.placements, &placement));
+    }
+    state.stack_sensitive |= placement_stack_sensitive(&placement.instance.item);
+    state.route_sensitive |= placement.instance.item.stop_index.is_some();
+    state.compression_sensitive = compression_sensitive;
+    state.packed.placements.push(placement);
+    let envelope_box = state.packed.placements[placement_index].envelope_box();
+    state.extent = grown_extent(state.extent, envelope_box);
+    // Retiring a point because it falls inside a solid's box assumes the box *is* the solid.
+    // For a hull it is not: a placement origin is a corner of a bounding box, and a hull
+    // leaves most of that box -- including, for a wedge, the origin itself -- available to the
+    // next item. Pruning them first would mean the engine could describe an interlocking pack
+    // it could never propose, and the exact collision test would be correct and never
+    // consulted.
+    if state.packed.placements[placement_index]
+        .hull_shape()
+        .is_none()
+    {
+        // Retained in place: collecting the covered points first only to remove them walked
+        // the set twice and allocated a vector the size of the frontier.
+        state
+            .points
+            .retain(|&(z, y, x)| !point_inside(Point { x, y, z }, envelope_box));
+    }
+    for point in exposed_points(state, envelope_box) {
+        absorb_point(state, point);
+    }
+    if let Some(loads) = calculate_top_loads(&state.packed.placements) {
+        for (placement, load) in state.packed.placements.iter_mut().zip(loads) {
+            placement.top_load = Weight(load.clamp(0, i64::MAX as i128) as i64);
+        }
+    }
+    if compression_sensitive {
+        state.used_volume = state.packed.used_volume();
+    }
+}
+
+fn point_inside(point: Point, box_: Aabb) -> bool {
+    point.x >= box_.origin.x
+        && point.x < box_.x2()
+        && point.y >= box_.origin.y
+        && point.y < box_.y2()
+        && point.z >= box_.origin.z
+        && point.z < box_.z2()
+}
+
+fn point_inside_any_solid(state: &ContainerState, point: Point) -> bool {
+    // Only the placements in the point's own bucket can contain it, so the spatial index
+    // answers what a scan of every placement used to.
+    let placements = &state.packed.placements;
+    let covered = state.spatial_index.bucket_at(point).iter().any(|&index| {
+        // A hull leaves most of its bounding box free, including -- for a wedge -- the origin
+        // itself, so treating that box as solid would drop exactly the points an interlocking
+        // pack needs. The same rule the retirement path applies.
+        placements[index].hull_shape().is_none()
+            && point_inside(point, placements[index].envelope_box())
+    });
+    covered
+        || state
+            .packed
+            .container
+            .obstacles
+            .iter()
+            .flat_map(Obstacle::boxes)
+            .any(|box_| point_inside(point, box_))
+}
+
+fn absorb_point(state: &mut ContainerState, point: Point) {
+    let boundary = state.packed.container.inner_dimensions;
+    if point.x >= boundary.length.0
+        || point.y >= boundary.width.0
+        || point.z >= boundary.height.0
+        || point_inside_any_solid(state, point)
+    {
+        return;
+    }
+    state.points.insert((point.z, point.y, point.x));
+}
+
+/// The six exposed corners plus their nearest projections onto surfaces below,
+/// behind and to the left. At most twelve points are retained per placement, giving
+/// the bounded hybrid scan a sparse, geometrically meaningful candidate source.
+fn exposed_points(state: &ContainerState, box_: Aabb) -> [Point; 12] {
+    let origin = box_.origin;
+    let x2 = box_.x2();
+    let y2 = box_.y2();
+    let z2 = box_.z2();
+    [
+        Point {
+            x: x2,
+            y: origin.y,
+            z: origin.z,
+        },
+        Point {
+            x: origin.x,
+            y: y2,
+            z: origin.z,
+        },
+        Point {
+            x: origin.x,
+            y: origin.y,
+            z: z2,
+        },
+        Point {
+            x: x2,
+            y: y2,
+            z: origin.z,
+        },
+        Point {
+            x: x2,
+            y: origin.y,
+            z: z2,
+        },
+        Point {
+            x: origin.x,
+            y: y2,
+            z: z2,
+        },
+        Point {
+            x: x2,
+            y: origin.y,
+            z: surface_z(state, x2, origin.y, origin.z),
+        },
+        Point {
+            x: x2,
+            y: surface_y(state, x2, origin.z, origin.y),
+            z: origin.z,
+        },
+        Point {
+            x: origin.x,
+            y: y2,
+            z: surface_z(state, origin.x, y2, origin.z),
+        },
+        Point {
+            x: surface_x(state, y2, origin.z, origin.x),
+            y: y2,
+            z: origin.z,
+        },
+        Point {
+            x: origin.x,
+            y: surface_y(state, origin.x, z2, origin.y),
+            z: z2,
+        },
+        Point {
+            x: surface_x(state, origin.y, z2, origin.x),
+            y: origin.y,
+            z: z2,
+        },
+    ]
+}
+
+fn surface_z(state: &ContainerState, x: i64, y: i64, ceiling: i64) -> i64 {
+    solid_boxes(state)
+        .filter(|box_| {
+            box_.z2() <= ceiling
+                && box_.origin.x <= x
+                && x < box_.x2()
+                && box_.origin.y <= y
+                && y < box_.y2()
+        })
+        .map(|box_| box_.z2())
+        .max()
+        .unwrap_or(0)
+}
+
+fn surface_y(state: &ContainerState, x: i64, z: i64, ceiling: i64) -> i64 {
+    solid_boxes(state)
+        .filter(|box_| {
+            box_.y2() <= ceiling
+                && box_.origin.x <= x
+                && x < box_.x2()
+                && box_.origin.z <= z
+                && z < box_.z2()
+        })
+        .map(|box_| box_.y2())
+        .max()
+        .unwrap_or(0)
+}
+
+fn surface_x(state: &ContainerState, y: i64, z: i64, ceiling: i64) -> i64 {
+    solid_boxes(state)
+        .filter(|box_| {
+            box_.x2() <= ceiling
+                && box_.origin.y <= y
+                && y < box_.y2()
+                && box_.origin.z <= z
+                && z < box_.z2()
+        })
+        .map(|box_| box_.x2())
+        .max()
+        .unwrap_or(0)
+}
+
+fn solid_boxes(state: &ContainerState) -> impl Iterator<Item = Aabb> + '_ {
+    state
+        .packed
+        .placements
+        .iter()
+        .map(Placement::envelope_box)
+        .chain(
+            state
+                .packed
+                .container
+                .obstacles
+                .iter()
+                .flat_map(Obstacle::boxes),
+        )
+}
+
+/// Square ticks of placed top faces directly under `box_`'s base plane.
+fn supporting_area(state: &ContainerState, box_: Aabb) -> i128 {
+    state
+        .packed
+        .placements
+        .iter()
+        .filter(|placement| placement.envelope_box().z2() == box_.origin.z)
+        .map(|placement| placement.envelope_box().overlap_area_xy(box_))
+        .sum::<i128>()
+}
+
+/// The reported fraction, for the placement record only: the feasibility decision reads
+/// the integer area through `support_area_sufficient`.
+fn support_ratio_of(area: i128, box_: Aabb) -> f64 {
+    if box_.origin.z == 0 {
+        return 1.0;
+    }
+    (area as f64 / box_.dimensions.base_area() as f64).min(1.0)
+}
+
+struct CandidateSupportView {
+    area: i128,
+    ratio: f64,
+    supporter_count: usize,
+    covered: bool,
+    placements: Vec<Placement>,
+    graph: ContactGraph,
+}
+
+fn placement_support_view(existing: &[Placement], candidate: &Placement) -> CandidateSupportView {
+    let mut placements = existing.to_vec();
+    placements.push(candidate.clone());
+    let candidate_index = placements.len() - 1;
+    let graph = ContactGraph::from_placements(&placements);
+    CandidateSupportView {
+        area: graph.support_area(candidate_index),
+        ratio: graph.support_ratio(&placements, candidate_index),
+        supporter_count: graph.supporters(candidate_index).len(),
+        covered: graph.touches_all_corners(&placements, candidate_index),
+        placements,
+        graph,
+    }
+}
+
+/// Item against item only, as docs/POLICY-RULES.md states it: a container's own tags
+/// restrict nothing through `incompatible_tags`.
+fn incompatible(state: &ContainerState, item: &ItemInstance) -> bool {
+    state.packed.placements.iter().any(|placement| {
+        !placement
+            .instance
+            .item
+            .tags
+            .is_disjoint(&item.item.incompatible_tags)
+            || !item
+                .item
+                .tags
+                .is_disjoint(&placement.instance.item.incompatible_tags)
+    })
+}
+
+fn candidate_respects_loads(
+    state: &ContainerState,
+    item: &ItemInstance,
+    candidate: &Candidate,
+    support_view: Option<&CandidateSupportView>,
+    sweep: Option<&LoadSweep>,
+) -> bool {
+    if !state.stack_sensitive
+        && !placement_stack_sensitive(&item.item)
+        && state.packed.container.max_stack_density.is_none()
+    {
+        return true;
+    }
+    let max_density = state.packed.container.max_stack_density;
+    if let Some(support_view) = support_view {
+        return load_rules_hold(&support_view.placements, &support_view.graph, max_density);
+    }
+    let candidate_box = Aabb {
+        origin: candidate.envelope_origin,
+        dimensions: candidate.envelope_dimensions,
+    };
+    // With no nesting anywhere in this container, the placement graph *is* the face
+    // graph, so the sweep prepared for this item answers from the placed scene's settled
+    // loads. With nesting present, the column-aware build stays authoritative, and it
+    // needs the placements themselves -- the two are required to agree exactly, which is
+    // what `contact_graph`'s append property test holds them to.
+    if let Some(sweep) = sweep {
+        return sweep.allows(LoadBody::of(&item.item, candidate_box));
+    }
+    let mut placements = state.packed.placements.clone();
+    placements.push(Placement {
+        instance: item.clone(),
+        position: candidate.position,
+        rotation: candidate.rotation,
+        dimensions: candidate.dimensions,
+        envelope_origin: candidate.envelope_origin,
+        envelope_dimensions: candidate.envelope_dimensions,
+        support_ratio: candidate.support_ratio,
+        top_load: Weight(0),
+        fixed: false,
+    });
+    let graph = ContactGraph::from_placements(&placements);
+    load_rules_hold(&placements, &graph, max_density)
+}
+
+/// Every bearing rule at once, the way `apply_candidate`'s predecessor checked them.
+fn load_rules_hold<T: LoadSubject>(
+    bodies: &[T],
+    graph: &ContactGraph,
+    max_density: Option<Weight>,
+) -> bool {
+    let Some(loads) = calculate_top_loads_with_graph(bodies, graph) else {
+        return false;
+    };
+    stack_limits_valid(bodies, graph)
+        && crush_free(bodies, &loads)
+        && stack_density_valid_with_loads(bodies, max_density, &loads)
+}
+
+/// The item facts the bearing rules read about one box, and nothing else. `Placement`
+/// answers from its item; `LoadBody` is the same facts copied or borrowed out once per
+/// sweep, so a candidate check never clones an `Item` -- its id, tags and metadata -- to
+/// read them.
+pub(crate) trait LoadSubject {
+    fn envelope(&self) -> Aabb;
+    fn weight_ticks(&self) -> i64;
+    fn max_top_load_ticks(&self) -> Option<i64>;
+    fn max_stacked_items(&self) -> Option<usize>;
+    fn max_compression_pressure_kpa(&self) -> Option<i64>;
+    fn stacking_group(&self) -> Option<&str>;
+    /// The code refusing an item of `upper_group` resting directly on this box.
+    fn stacking_refusal(&self, upper_group: Option<&str>) -> Option<&'static str>;
+}
+
+impl LoadSubject for Placement {
+    fn envelope(&self) -> Aabb {
+        self.envelope_box()
+    }
+    fn weight_ticks(&self) -> i64 {
+        self.instance.item.weight.0
+    }
+    fn max_top_load_ticks(&self) -> Option<i64> {
+        self.instance.item.max_top_load.map(|weight| weight.0)
+    }
+    fn max_stacked_items(&self) -> Option<usize> {
+        self.instance.item.max_stacked_items
+    }
+    fn max_compression_pressure_kpa(&self) -> Option<i64> {
+        self.instance.item.max_compression_pressure_kpa
+    }
+    fn stacking_group(&self) -> Option<&str> {
+        self.instance.item.stacking_group.as_deref()
+    }
+    fn stacking_refusal(&self, upper_group: Option<&str>) -> Option<&'static str> {
+        self.instance.item.stacking_refusal(upper_group)
+    }
+}
+
+/// The stacking facts are borrowed from the placed item rather than copied, so a body
+/// stays `Copy` and a request with no stacking groups pays nothing for them.
+#[derive(Clone, Copy, Debug)]
+struct LoadBody<'a> {
+    envelope: Aabb,
+    weight: i64,
+    stackable: bool,
+    max_top_load: Option<i64>,
+    max_stacked_items: Option<usize>,
+    max_compression_pressure_kpa: Option<i64>,
+    stacking_group: Option<&'a str>,
+    accepts_stacking_groups: &'a BTreeSet<String>,
+}
+
+impl<'a> LoadBody<'a> {
+    fn of(item: &'a Item, envelope: Aabb) -> Self {
+        Self {
+            envelope,
+            weight: item.weight.0,
+            stackable: item.stackable,
+            max_top_load: item.max_top_load.map(|weight| weight.0),
+            max_stacked_items: item.max_stacked_items,
+            max_compression_pressure_kpa: item.max_compression_pressure_kpa,
+            stacking_group: item.stacking_group.as_deref(),
+            accepts_stacking_groups: &item.accepts_stacking_groups,
+        }
+    }
+
+    /// Whether anything at all may be refused on this body's top face.
+    fn refuses_load(&self) -> bool {
+        !self.stackable || !self.accepts_stacking_groups.is_empty()
+    }
+}
+
+impl LoadSubject for LoadBody<'_> {
+    fn envelope(&self) -> Aabb {
+        self.envelope
+    }
+    fn weight_ticks(&self) -> i64 {
+        self.weight
+    }
+    fn max_top_load_ticks(&self) -> Option<i64> {
+        self.max_top_load
+    }
+    fn max_stacked_items(&self) -> Option<usize> {
+        self.max_stacked_items
+    }
+    fn max_compression_pressure_kpa(&self) -> Option<i64> {
+        self.max_compression_pressure_kpa
+    }
+    fn stacking_group(&self) -> Option<&str> {
+        self.stacking_group
+    }
+    fn stacking_refusal(&self, upper_group: Option<&str>) -> Option<&'static str> {
+        stacking_refusal(self.stackable, self.accepts_stacking_groups, upper_group)
+    }
+}
+
+/// The placed scene's bearing state, settled once per candidate sweep.
+///
+/// built the contact graph once per sweep and appended each candidate to a
+/// clone of it; the loads were still recomputed from nothing, over a cloned
+/// `Vec<Placement>`, for every candidate. Here the loads are settled once too, and a
+/// candidate is judged by recomputing only the boxes whose load it can change: everything
+/// reachable downward from it, and from whatever already rests on its top face. The
+/// recomputation applies the exact distribution rule `calculate_top_loads_with_graph`
+/// applies -- same supporter order, same floor-and-remainder split -- so the verdict is
+/// the one a from-scratch rebuild gives; the differential test below holds it to that.
+/// Cost per candidate is `O(|affected| * degree)` instead of `O(n log n + e)` plus a
+/// deep clone of the scene.
+struct LoadSweep<'a> {
+    graph: ContactGraph,
+    bodies: Vec<LoadBody<'a>>,
+    /// `None` when the placed scene breaks a bearing edge on its own.
+    base_loads: Option<Vec<i128>>,
+    /// Whether the placed scene passes every bearing rule by itself. When it does not,
+    /// only a rebuild can say whether a candidate repairs it: one placed under an
+    /// overhang joins that box's supporters and shrinks the shares its other supporters
+    /// carry, and the remainder split is not monotone in the load above it either.
+    base_holds: bool,
+    max_density: Option<Weight>,
+}
+
+impl<'a> LoadSweep<'a> {
+    fn new(state: &'a ContainerState, widest_footprint: i64) -> Self {
+        let bodies = state
+            .packed
+            .placements
+            .iter()
+            .map(|placement| LoadBody::of(&placement.instance.item, placement.envelope_box()))
+            .collect::<Vec<_>>();
+        let boxes = bodies.iter().map(|body| body.envelope).collect::<Vec<_>>();
+        let graph = ContactGraph::with_cell_hint(&boxes, widest_footprint);
+        let max_density = state.packed.container.max_stack_density;
+        let base_loads = calculate_top_loads_with_graph(&bodies, &graph);
+        let base_holds = base_loads.as_ref().is_some_and(|loads| {
+            stack_limits_valid(&bodies, &graph)
+                && crush_free(&bodies, loads)
+                && stack_density_valid_with_loads(&bodies, max_density, loads)
+        });
+        Self {
+            graph,
+            bodies,
+            base_loads,
+            base_holds,
+            max_density,
+        }
+    }
+
+    fn allows(&self, candidate: LoadBody<'_>) -> bool {
+        let footprint = candidate
+            .envelope
+            .dimensions
+            .length
+            .0
+            .max(candidate.envelope.dimensions.width.0);
+        if footprint > self.graph.cell() || !self.base_holds {
+            return self.rebuilt_with(candidate);
+        }
+        let Some(base_loads) = self.base_loads.as_ref() else {
+            return self.rebuilt_with(candidate);
+        };
+        let below = self.graph.contacts_below(candidate.envelope);
+        let above = self.graph.contacts_above(candidate.envelope);
+        // The only new edges: a supporter may refuse the candidate, and the candidate may
+        // refuse whatever already rests on its top face -- `stackable: false` or a stacking
+        // group its list omits, one test per edge.
+        if below.iter().any(|edge| {
+            self.bodies[edge.index]
+                .stacking_refusal(candidate.stacking_group)
+                .is_some()
+        }) {
+            return false;
+        }
+        if candidate.refuses_load()
+            && above.iter().any(|edge| {
+                candidate
+                    .stacking_refusal(self.bodies[edge.index].stacking_group)
+                    .is_some()
+            })
+        {
+            return false;
+        }
+        let scene = CandidateScene {
+            sweep: self,
+            candidate,
+            below: &below,
+            above: &above,
+        };
+        let candidate_index = self.bodies.len();
+        let mut affected = BTreeSet::new();
+        let mut pending = above.iter().map(|edge| edge.index).collect::<Vec<_>>();
+        pending.push(candidate_index);
+        while let Some(index) = pending.pop() {
+            if affected.insert(index) {
+                pending.extend(scene.supporters(index).iter().map(|edge| edge.index));
+            }
+        }
+        // The same order `calculate_top_loads_with_graph` settles loads in: top faces
+        // descending, then bases descending, then index -- `affected` is ascending and
+        // the sort is stable, so ties keep index order.
+        let mut order = affected.iter().copied().collect::<Vec<_>>();
+        order.sort_by_key(|index| {
+            let envelope = scene.body(*index).envelope;
+            Reverse((envelope.z2(), envelope.origin.z))
+        });
+        let mut loads = BTreeMap::new();
+        for index in order {
+            let mut children = scene.children(index);
+            children.sort_by_key(|child| {
+                let envelope = scene.body(*child).envelope;
+                (Reverse((envelope.z2(), envelope.origin.z)), *child)
+            });
+            let mut load = 0_i128;
+            for child in children {
+                let downward = i128::from(scene.body(child).weight).saturating_add(
+                    loads
+                        .get(&child)
+                        .copied()
+                        .unwrap_or_else(|| base_loads[child]),
+                );
+                load = load.saturating_add(scene.share(child, index, downward));
+            }
+            if let Some(maximum) = scene.body(index).max_top_load
+                && load > i128::from(maximum)
+            {
+                return false;
+            }
+            loads.insert(index, load);
+        }
+        for (index, load) in &loads {
+            let body = scene.body(*index);
+            let footprint_area = body.envelope.dimensions.base_area();
+            if let Some(limit) = body.max_compression_pressure_kpa
+                && crush_exceeded(limit, *load, footprint_area)
+            {
+                return false;
+            }
+            if let Some(maximum) = self.max_density
+                && !density_within(body.weight, *load, maximum, footprint_area)
+            {
+                return false;
+            }
+        }
+        scene.stack_counts_hold(&affected)
+    }
+
+    /// The from-scratch verdict, for the cases the delta cannot answer.
+    fn rebuilt_with(&self, candidate: LoadBody<'_>) -> bool {
+        let mut bodies = self.bodies.clone();
+        bodies.push(candidate);
+        let boxes = bodies.iter().map(|body| body.envelope).collect::<Vec<_>>();
+        let footprint = candidate
+            .envelope
+            .dimensions
+            .length
+            .0
+            .max(candidate.envelope.dimensions.width.0);
+        let graph = ContactGraph::with_cell_hint(&boxes, footprint.max(self.graph.cell()));
+        load_rules_hold(&bodies, &graph, self.max_density)
+    }
+}
+
+/// The placed scene plus one candidate, read as the graph `with_box` would have built:
+/// the candidate takes the next index, rests on `below`, and joins the supporter list of
+/// every box in `above` at the end.
+struct CandidateScene<'a> {
+    sweep: &'a LoadSweep<'a>,
+    candidate: LoadBody<'a>,
+    below: &'a [ContactEdge],
+    above: &'a [ContactEdge],
+}
+
+impl CandidateScene<'_> {
+    fn candidate_index(&self) -> usize {
+        self.sweep.bodies.len()
+    }
+
+    fn body(&self, index: usize) -> LoadBody<'_> {
+        if index == self.candidate_index() {
+            self.candidate
+        } else {
+            self.sweep.bodies[index]
+        }
+    }
+
+    fn supporters(&self, index: usize) -> Vec<ContactEdge> {
+        if index == self.candidate_index() {
+            return self.below.to_vec();
+        }
+        let mut supporters = self.sweep.graph.supporters(index).to_vec();
+        if let Some(edge) = self.above.iter().find(|edge| edge.index == index) {
+            supporters.push(ContactEdge {
+                index: self.candidate_index(),
+                area: edge.area,
+            });
+        }
+        supporters
+    }
+
+    fn children(&self, index: usize) -> Vec<usize> {
+        if index == self.candidate_index() {
+            return self.above.iter().map(|edge| edge.index).collect();
+        }
+        let mut children = self.sweep.graph.children(index).to_vec();
+        if self.below.iter().any(|edge| edge.index == index) {
+            children.push(self.candidate_index());
+        }
+        children
+    }
+
+    /// `upper`'s share of `downward` onto `lower`: proportional by contact area, with
+    /// the last supporter taking the rounding remainder, exactly as the settled loads.
+    fn share(&self, upper: usize, lower: usize, downward: i128) -> i128 {
+        let supporters = self.supporters(upper);
+        let total_area = supporters.iter().map(|edge| edge.area).sum::<i128>();
+        let mut distributed = 0_i128;
+        for (position, edge) in supporters.iter().enumerate() {
+            let share = if position + 1 == supporters.len() {
+                downward.saturating_sub(distributed)
+            } else {
+                downward.saturating_mul(edge.area) / total_area
+            };
+            if edge.index == lower {
+                return share;
+            }
+            distributed = distributed.saturating_add(share);
+        }
+        0
+    }
+
+    /// `max_stacked_items` over the boxes whose stack the candidate joins: those below
+    /// it gain the candidate and everything already resting on it; nothing else changes.
+    fn stack_counts_hold(&self, affected: &BTreeSet<usize>) -> bool {
+        let candidate_index = self.candidate_index();
+        let mut carried_by_candidate = BTreeSet::new();
+        let mut pending = self.above.iter().map(|edge| edge.index).collect::<Vec<_>>();
+        while let Some(index) = pending.pop() {
+            if carried_by_candidate.insert(index) {
+                pending.extend(self.sweep.graph.children(index).iter().copied());
+            }
+        }
+        if let Some(maximum) = self.candidate.max_stacked_items
+            && carried_by_candidate.len() > maximum
+        {
+            return false;
+        }
+        let mut under_candidate = BTreeSet::new();
+        pending = self.below.iter().map(|edge| edge.index).collect();
+        while let Some(index) = pending.pop() {
+            if under_candidate.insert(index) {
+                pending.extend(
+                    self.sweep
+                        .graph
+                        .supporters(index)
+                        .iter()
+                        .map(|edge| edge.index),
+                );
+            }
+        }
+        debug_assert!(under_candidate.iter().all(|index| affected.contains(index)));
+        for root in under_candidate {
+            let Some(maximum) = self.sweep.bodies[root].max_stacked_items else {
+                continue;
+            };
+            let mut stacked = carried_by_candidate.clone();
+            stacked.insert(candidate_index);
+            pending = self.sweep.graph.children(root).to_vec();
+            while let Some(index) = pending.pop() {
+                if stacked.insert(index) {
+                    pending.extend(self.sweep.graph.children(index).iter().copied());
+                }
+            }
+            if stacked.len() > maximum {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn density_within(weight: i64, load: i128, maximum: Weight, footprint_area: i128) -> bool {
+    const SQUARE_METRE_TICKS: i128 = 16_000_000_i128 * 16_000_000_i128;
+    let total = i128::from(weight).saturating_add(load);
+    total.saturating_mul(SQUARE_METRE_TICKS) <= i128::from(maximum.0).saturating_mul(footprint_area)
+}
+
+fn ground_contact_allowed(rule: Option<&str>, candidate: Aabb, placements: &[Placement]) -> bool {
+    if candidate.origin.z == 0 || matches!(rule, None | Some("free")) {
+        return true;
+    }
+    let supporters = placements
+        .iter()
+        .map(Placement::envelope_box)
+        .filter(|other| other.z2() == candidate.origin.z && other.overlap_area_xy(candidate) > 0)
+        .collect::<Vec<_>>();
+    match rule {
+        Some("single") => supporters.len() == 1,
+        Some("multiple") => supporters.len() >= 2,
+        Some("covered") => {
+            let corners = [
+                (candidate.origin.x, candidate.origin.y),
+                (candidate.x2(), candidate.origin.y),
+                (candidate.origin.x, candidate.y2()),
+                (candidate.x2(), candidate.y2()),
+            ];
+            corners.iter().all(|(x, y)| {
+                supporters.iter().any(|surface| {
+                    surface.origin.x <= *x
+                        && *x <= surface.x2()
+                        && surface.origin.y <= *y
+                        && *y <= surface.y2()
+                })
+            })
+        }
+        _ => true,
+    }
+}
+
+fn ground_contact_allowed_from_view(
+    rule: Option<&str>,
+    candidate_z: i64,
+    support: &CandidateSupportView,
+) -> bool {
+    if candidate_z == 0 || matches!(rule, None | Some("free")) {
+        return true;
+    }
+    match rule {
+        Some("single") => support.supporter_count == 1,
+        Some("multiple") => support.supporter_count >= 2,
+        Some("covered") => support.covered,
+        _ => true,
+    }
+}
+
+/// A placement with no `stop_index` is never scheduled for removal and rides the whole
+/// route, so nothing can be blocking it -- but it does block everything beneath it.
+/// Ordering it after every real stop expresses both halves at once, and is what
+/// docs/VALIDATION-CONTRACT.md and the shared validator already assume.
+const RIDES_THE_WHOLE_ROUTE: usize = usize::MAX;
+
+/// Corridors that are open in one immutable placement state.
+///
+/// Construction is `O(m² * |D|)` time and `O(m * |D|)` space. Every candidate then costs
+/// `O(m * |D|)` rather than rebuilding the same placed-vs-placed intersections.
+struct StopAccessibilityBase {
+    candidate_stop: usize,
+    stops: Vec<usize>,
+    clear_sweeps: Vec<Vec<geometry::SweptRegion>>,
+    inert: bool,
+}
+
+impl StopAccessibilityBase {
+    fn new(
+        candidate_stop: Option<usize>,
+        placements: &[Placement],
+        container: Dimensions,
+        directions: &[String],
+    ) -> Self {
+        let candidate_stop = candidate_stop.unwrap_or(RIDES_THE_WHOLE_ROUTE);
+        let stops = placements
+            .iter()
+            .map(|placement| {
+                placement
+                    .instance
+                    .item
+                    .stop_index
+                    .unwrap_or(RIDES_THE_WHOLE_ROUTE)
+            })
+            .collect::<Vec<_>>();
+        let inert = directions.is_empty() || stops.iter().all(|stop| *stop == candidate_stop);
+        if inert {
+            return Self {
+                candidate_stop,
+                stops,
+                clear_sweeps: Vec::new(),
+                inert,
+            };
+        }
+
+        let boxes = placements
+            .iter()
+            .map(Placement::envelope_box)
+            .collect::<Vec<_>>();
+        let clear_sweeps = boxes
+            .iter()
+            .enumerate()
+            .map(|(index, box_)| {
+                if stops[index] == RIDES_THE_WHOLE_ROUTE {
+                    return Vec::new();
+                }
+                directions
+                    .iter()
+                    .filter_map(|direction| geometry::swept_volume(*box_, container, direction))
+                    .filter(|sweep| {
+                        !boxes.iter().enumerate().any(|(other, other_box)| {
+                            other != index
+                                && stops[other] > stops[index]
+                                && geometry::sweep_intersects(*sweep, *other_box)
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            candidate_stop,
+            stops,
+            clear_sweeps,
+            inert,
+        }
+    }
+
+    fn allows(
+        &self,
+        candidate: Aabb,
+        placements: &[Placement],
+        container: Dimensions,
+        directions: &[String],
+    ) -> bool {
+        if self.inert {
+            return true;
+        }
+
+        for (index, sweeps) in self.clear_sweeps.iter().enumerate() {
+            if self.candidate_stop <= self.stops[index] {
+                continue;
+            }
+            if !sweeps
+                .iter()
+                .any(|sweep| !geometry::sweep_intersects(*sweep, candidate))
+            {
+                return false;
+            }
+        }
+
+        if self.candidate_stop == RIDES_THE_WHOLE_ROUTE {
+            return true;
+        }
+        directions.iter().any(|direction| {
+            geometry::swept_volume(candidate, container, direction).is_some_and(|sweep| {
+                !placements.iter().zip(&self.stops).any(|(placement, stop)| {
+                    *stop > self.candidate_stop
+                        && geometry::sweep_intersects(sweep, placement.envelope_box())
+                })
+            })
+        })
+    }
+}
+
+/// The horizontal half of route order: nothing due later may stand between an earlier item
+/// and a door.
+///
+/// `route_contact_allowed` above enforces the vertical half -- nothing due later may rest
+/// *above* something due earlier. Both are necessary and neither implies the other;
+/// docs/STOP-ACCESSIBILITY.md derives the rule and the post-validator's whole-scene replay
+/// remains the sufficient check.
+///
+/// Inert unless the caller supplied exit directions, because the request schema has no
+/// field for them: assuming all six walls open would enforce a rule true of no real
+/// vehicle and nearly vacuous besides, since a box is almost always free through *some*
+/// face.
+///
+/// The blocker set is `{q : s(q) > s(p)}` -- strictly later. Items due at the *same* stop
+/// are excluded because the order within a stop is free: whichever is in the way comes off
+/// first. Using `>=` would refuse two same-stop pallets standing one behind the other.
+#[cfg(test)]
+fn stop_accessible(
+    candidate_stop: Option<usize>,
+    candidate: Aabb,
+    placements: &[Placement],
+    container: Dimensions,
+    directions: &[String],
+) -> bool {
+    if directions.is_empty() {
+        return true;
+    }
+    let candidate_stop = candidate_stop.unwrap_or(RIDES_THE_WHOLE_ROUTE);
+    let stop_of = |placement: &Placement| {
+        placement
+            .instance
+            .item
+            .stop_index
+            .unwrap_or(RIDES_THE_WHOLE_ROUTE)
+    };
+    if placements
+        .iter()
+        .all(|placement| stop_of(placement) == candidate_stop)
+    {
+        return true;
+    }
+    for (index, placement) in placements.iter().enumerate() {
+        let stop = stop_of(placement);
+        if candidate_stop <= stop {
+            continue;
+        }
+        let box_ = placement.envelope_box();
+        let open = directions.iter().any(|direction| {
+            geometry::swept_volume(box_, container, direction).is_some_and(|sweep| {
+                !geometry::sweep_intersects(sweep, candidate)
+                    && !placements.iter().enumerate().any(|(other, blocker)| {
+                        other != index
+                            && stop_of(blocker) > stop
+                            && geometry::sweep_intersects(sweep, blocker.envelope_box())
+                    })
+            })
+        });
+        if !open {
+            return false;
+        }
+    }
+    if candidate_stop == RIDES_THE_WHOLE_ROUTE {
+        return true;
+    }
+    directions.iter().any(|direction| {
+        geometry::swept_volume(candidate, container, direction).is_some_and(|sweep| {
+            !placements.iter().any(|blocker| {
+                stop_of(blocker) > candidate_stop
+                    && geometry::sweep_intersects(sweep, blocker.envelope_box())
+            })
+        })
+    })
+}
+
+fn route_contact_allowed(
+    candidate_stop: Option<usize>,
+    candidate: Aabb,
+    placements: &[Placement],
+) -> bool {
+    let candidate_stop = candidate_stop.unwrap_or(RIDES_THE_WHOLE_ROUTE);
+    placements.iter().all(|other| {
+        let other_stop = other
+            .instance
+            .item
+            .stop_index
+            .unwrap_or(RIDES_THE_WHOLE_ROUTE);
+        if candidate_stop == RIDES_THE_WHOLE_ROUTE && other_stop == RIDES_THE_WHOLE_ROUTE {
+            return true;
+        }
+        let other_box = other.envelope_box();
+        if other_box.overlap_area_xy(candidate) == 0 {
+            return true;
+        }
+        if other_box.z2() == candidate.origin.z {
+            candidate_stop <= other_stop
+        } else if candidate.z2() == other_box.origin.z {
+            candidate_stop >= other_stop
+        } else {
+            true
+        }
+    })
+}
+
+fn exceeds_void_fill_reserve(
+    state: &ContainerState,
+    item: &ItemInstance,
+    candidate: &Candidate,
+) -> bool {
+    let reserve = state.packed.container.inner_dimensions.volume()
+        * state.packed.container.void_fill_reserve_ppm
+        / 1_000_000;
+    if reserve == 0 {
+        return false;
+    }
+    let placement = Placement {
+        instance: item.clone(),
+        position: candidate.position,
+        rotation: candidate.rotation,
+        dimensions: candidate.dimensions,
+        envelope_origin: candidate.envelope_origin,
+        envelope_dimensions: candidate.envelope_dimensions,
+        support_ratio: candidate.support_ratio,
+        top_load: Weight(0),
+        fixed: false,
+    };
+    let projected = if state.compression_sensitive
+        || item.item.shape_type == ShapeType::Compressible
+    {
+        // A zero-load candidate is at its largest, while appending it can only shrink
+        // existing compressible supports. When this upper bound fits, an exact graph
+        // refresh cannot turn it into a reserve violation. Only candidates close to the
+        // boundary pay the non-local calculation.
+        let upper_bound = state
+            .used_volume
+            .saturating_add(occupied_volume(&placement));
+        if upper_bound.saturating_add(reserve) <= state.packed.container.inner_dimensions.volume() {
+            upper_bound
+        } else {
+            used_volume_with_current_loads(&state.packed, placement)
+        }
+    } else {
+        state
+            .used_volume
+            .saturating_add(used_volume_delta(&state.packed.placements, &placement))
+    };
+    projected.saturating_add(reserve) > state.packed.container.inner_dimensions.volume()
+}
+
+/// Physical volume after an appended placement changes the support loads in the scene.
+///
+/// Compression makes the delta non-local: an upper item can shrink existing supports.
+/// The ordinary rigid path remains O(1). One composite refresh is
+/// O(n log n + q + e) time and O(n + e) graph space, where q is broad-phase work and e
+/// is the contact-edge count; both are O(n^2) in a physically dense worst case. The
+/// whole-solve sum over candidates and search nodes is documented separately.
+fn used_volume_with_current_loads(packed: &PackedContainer, placement: Placement) -> i128 {
+    let mut projected = packed.clone();
+    projected.placements.push(placement);
+    if let Some(loads) = calculate_top_loads(&projected.placements) {
+        for (placement, load) in projected.placements.iter_mut().zip(loads) {
+            placement.top_load = Weight(load.clamp(0, i64::MAX as i128) as i64);
+        }
+    }
+    projected.used_volume()
+}
+
+fn placement_stack_sensitive(item: &Item) -> bool {
+    item.is_stack_sensitive()
+}
+
+/// Physical-volume change from appending one placement.
+///
+/// Existing overlap pairs cannot change. The common non-nesting case is O(1);
+/// nesting-aware candidates scan the already placed items once, O(n) time and O(1)
+/// space. This replaces cloning the whole container and recomputing O(n^2) nesting
+/// volume for every candidate orientation.
+fn used_volume_delta(placements: &[Placement], placement: &Placement) -> i128 {
+    let mut delta = occupied_volume(placement);
+    let Some(depth) = placement.instance.item.nesting_height else {
+        return delta;
+    };
+    let overlap = (depth.0 as i128).saturating_mul(placement.envelope_dimensions.base_area());
+    for existing in placements {
+        if valid_nesting(existing, placement) {
+            delta = delta.saturating_sub(overlap);
+        }
+    }
+    delta
+}
+
+fn stack_limits_valid<T: LoadSubject>(bodies: &[T], graph: &ContactGraph) -> bool {
+    for (root, body) in bodies.iter().enumerate() {
+        let Some(maximum) = body.max_stacked_items() else {
+            continue;
+        };
+        let mut seen = BTreeSet::new();
+        let mut pending = graph.children(root).to_vec();
+        while let Some(index) = pending.pop() {
+            if seen.insert(index) {
+                pending.extend(graph.children(index).iter().copied());
+            }
+        }
+        if seen.len() > maximum {
+            return false;
+        }
+    }
+    true
+}
+
+fn stack_density_valid_with_loads<T: LoadSubject>(
+    bodies: &[T],
+    maximum: Option<Weight>,
+    loads: &[i128],
+) -> bool {
+    let Some(maximum) = maximum else {
+        return true;
+    };
+    bodies.iter().zip(loads).all(|(body, load)| {
+        density_within(
+            body.weight_ticks(),
+            *load,
+            maximum,
+            body.envelope().dimensions.base_area(),
+        )
+    })
+}
+
+/// `crushed` without the offender's name, over any bearing subject.
+fn crush_free<T: LoadSubject>(bodies: &[T], loads: &[i128]) -> bool {
+    bodies.iter().zip(loads).all(|(body, load)| {
+        body.max_compression_pressure_kpa().is_none_or(|limit| {
+            !crush_exceeded(limit, *load, body.envelope().dimensions.base_area())
+        })
+    })
+}
+
+pub fn calculate_top_loads(placements: &[Placement]) -> Option<Vec<i128>> {
+    let graph = ContactGraph::from_placements(placements);
+    calculate_top_loads_with_graph(placements, &graph)
+}
+
+fn calculate_top_loads_with_graph<T: LoadSubject>(
+    bodies: &[T],
+    graph: &ContactGraph,
+) -> Option<Vec<i128>> {
+    let mut loads = vec![0_i128; bodies.len()];
+    let mut order = (0..bodies.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| {
+        let envelope = bodies[*index].envelope();
+        Reverse((envelope.z2(), envelope.origin.z))
+    });
+
+    for upper_index in order {
+        let upper = bodies[upper_index].envelope();
+        if upper.origin.z == 0 {
+            continue;
+        }
+        let supports = graph.supporters(upper_index);
+        if supports.is_empty() {
+            continue;
+        }
+        let total_area = supports.iter().map(|edge| edge.area).sum::<i128>();
+        let downward = i128::from(bodies[upper_index].weight_ticks()) + loads[upper_index];
+        let mut distributed = 0_i128;
+        for (position, edge) in supports.iter().enumerate() {
+            let share = if position + 1 == supports.len() {
+                downward.saturating_sub(distributed)
+            } else {
+                downward.saturating_mul(edge.area) / total_area
+            };
+            distributed = distributed.saturating_add(share);
+            let support = &bodies[edge.index];
+            // `stackable: false` is geometry, not load: nothing may rest on the item at
+            // all. Gating it on `share > 0` meant a weightless box resting on a
+            // non-stackable one transferred nothing and so was waved through, and since
+            // nothing here self-validates the answer came back `feasible` while the
+            // shared validator called it `non_stackable`.
+            if support
+                .stacking_refusal(bodies[upper_index].stacking_group())
+                .is_some()
+            {
+                return None;
+            }
+            loads[edge.index] = loads[edge.index].saturating_add(share);
+            if let Some(maximum) = support.max_top_load_ticks()
+                && loads[edge.index] > i128::from(maximum)
+            {
+                return None;
+            }
+        }
+    }
+    Some(loads)
+}
+
+fn inventory(request: &PackingRequest) -> BTreeMap<String, Option<usize>> {
+    request
+        .containers
+        .iter()
+        .map(|container| (container.id.clone(), container.quantity))
+        .collect()
+}
+
+fn decrement(inventory: &mut BTreeMap<String, Option<usize>>, id: &str) {
+    if let Some(Some(value)) = inventory.get_mut(id) {
+        *value = value.saturating_sub(1);
+    }
+}
+
+fn eligible_containers(
+    request: &PackingRequest,
+    items: &[ItemInstance],
+    inventory: &BTreeMap<String, Option<usize>>,
+) -> Vec<Container> {
+    let mut containers = request
+        .containers
+        .iter()
+        .filter(|container| {
+            inventory
+                .get(&container.id)
+                .copied()
+                .flatten()
+                .map(|value| value > 0)
+                .unwrap_or(true)
+                && items.iter().any(|item| {
+                    (item.item.eligible_container_tags.is_empty()
+                        || !item
+                            .item
+                            .eligible_container_tags
+                            .is_disjoint(&container.tags))
+                        && item
+                            .item
+                            .dimensions
+                            .unique_rotations(&item.item.allowed_rotations)
+                            .iter()
+                            .any(|(_, dimensions)| {
+                                container.fits_alone(dimensions.expand(request.config.clearance))
+                            })
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    containers.sort_by_key(|container| container_order_key(container, &request.config));
+    containers
+}
+
+/// Trial-pack as many of `remaining` as this one container can hold, batching group
+/// members together. Returns the resulting state (possibly empty, if
+/// nothing fit) and whatever did not fit. Metrics accumulate into the caller's
+/// shared counters even for a trial that is ultimately discarded, matching Python's
+/// `_across_containers`/PHP's `acrossContainers`, which do the same per-template
+/// work and pay for it in `SolverMetrics` regardless of which template wins.
+#[allow(clippy::too_many_arguments)]
+fn try_pack_into(
+    container: &Container,
+    sequence: usize,
+    remaining: &[ItemInstance],
+    request: &PackingRequest,
+    constraints: &[Arc<dyn PlacementConstraint>],
+    scorers: &[Arc<dyn CandidateScorer>],
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+) -> (ContainerState, Vec<ItemInstance>) {
+    if request.config.container_plan_beam_width > 1 {
+        return try_pack_into_beam(
+            container,
+            sequence,
+            remaining,
+            request,
+            constraints,
+            scorers,
+            deadline,
+            metrics,
+        );
+    }
+    try_pack_into_greedy(
+        container,
+        sequence,
+        remaining,
+        request,
+        constraints,
+        scorers,
+        deadline,
+        metrics,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_pack_into_greedy(
+    container: &Container,
+    sequence: usize,
+    remaining: &[ItemInstance],
+    request: &PackingRequest,
+    constraints: &[Arc<dyn PlacementConstraint>],
+    scorers: &[Arc<dyn CandidateScorer>],
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+) -> (ContainerState, Vec<ItemInstance>) {
+    let mut state = ContainerState::new(container.clone(), sequence);
+    let current = remaining;
+    let mut next = Vec::new();
+    let mut processed = vec![false; current.len()];
+    let mut groups = group_member_indices(current);
+
+    for cursor in 0..current.len() {
+        // A member placed with its group is no work left, so it is skipped before the
+        // budget is asked: only an unplaced item can be refused.
+        if processed[cursor] {
+            continue;
+        }
+        if deadline.effort_stops(request, metrics) {
+            next.extend(
+                current
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !processed[*index])
+                    .map(|(_, item)| item.clone()),
+            );
+            break;
+        }
+        metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
+        let batch_indices = if let Some(group) = current[cursor].item.group.as_deref() {
+            groups
+                .remove(group)
+                .expect("first unprocessed group member")
+        } else {
+            vec![cursor]
+        };
+        for index in &batch_indices {
+            processed[*index] = true;
+        }
+        let batch = batch_indices
+            .iter()
+            .map(|index| current[*index].clone())
+            .collect::<Vec<_>>();
+        // `apply_candidate` only runs when a candidate exists, so a single-item
+        // batch that fails has not touched `state` and needs no rollback; only a
+        // multi-item group can be left half-applied. The snapshot deep-copies
+        // every placement, candidate point and spatial-index bucket accumulated
+        // so far, so cloning it once per item on the default ungrouped path was
+        // pure allocator load.
+        let snapshot = (batch.len() > 1).then(|| state.clone());
+        let mut accepted = true;
+        for item in &batch {
+            let candidates = find_candidates(
+                &state,
+                item,
+                request,
+                constraints,
+                scorers,
+                request.config.max_candidates_per_item,
+                PointSet::Sparse,
+                deadline,
+                metrics,
+            );
+            if let Some(candidate) = candidates.first() {
+                apply_candidate(&mut state, item.clone(), candidate);
+            } else {
+                accepted = false;
+                break;
+            }
+        }
+        if !accepted {
+            if let Some(snapshot) = snapshot {
+                state = snapshot;
+            }
+            next.extend(batch);
+        }
+    }
+    (state, next)
+}
+
+#[derive(Clone)]
+struct ContainerBeamNode {
+    state: ContainerState,
+    unplaced: Vec<ItemInstance>,
+}
+
+/// How many of the cheapest costs fit in `capacity`, read off their prefix sums. Costs are
+/// non-negative, so the sums never decrease and the count is one binary search: `O(log f)`
+/// per node instead of the `O(f)` walk.
+fn count_with_capacity(cumulative_costs: &[i128], capacity: i128) -> usize {
+    cumulative_costs.partition_point(|&used| used <= capacity)
+}
+
+/// Prefix sums of the future items' ascending costs, built once for a whole beam step rather
+/// than per node: the bound below reads them for every node in the beam, and sorting them
+/// there was the loop's own cost, not the search's.
+struct PrecomputedFuture {
+    volumes: Option<Vec<i128>>,
+    weights: Option<Vec<i128>>,
+    len: usize,
+}
+
+impl PrecomputedFuture {
+    fn new(future: &[ItemInstance], weighed: bool) -> Self {
+        if future.is_empty() {
+            return Self {
+                volumes: None,
+                weights: None,
+                len: 0,
+            };
+        }
+        // A nesting item's volume is not what it occupies, so the volume bound stands down
+        // for the whole set, exactly as it did when it was computed per node. The rest count
+        // what they occupy, as the free space they are compared with does: two wedges each
+        // declaring the whole crate both fit in it.
+        let volumes = future
+            .iter()
+            .all(|item| item.item.nesting_height.is_none())
+            .then(|| {
+                cumulative(
+                    future
+                        .iter()
+                        .map(|item| super::exact::occupied_item_volume(&item.item)),
+                )
+            });
+        let weights =
+            weighed.then(|| cumulative(future.iter().map(|item| i128::from(item.item.weight.0))));
+        Self {
+            volumes,
+            weights,
+            len: future.len(),
+        }
+    }
+}
+
+fn cumulative(costs: impl Iterator<Item = i128>) -> Vec<i128> {
+    let mut costs: Vec<i128> = costs.collect();
+    costs.sort_unstable();
+    let mut used = 0_i128;
+    for cost in &mut costs {
+        used = used.saturating_add(*cost);
+        *cost = used;
+    }
+    costs
+}
+
+fn unpacked_lower_bound(
+    state: &ContainerState,
+    unplaced_count: usize,
+    future: &PrecomputedFuture,
+) -> usize {
+    if future.len == 0 {
+        return unplaced_count;
+    }
+    let mut possible = future.len;
+    if let Some(volumes) = &future.volumes {
+        let free = (state.packed.container.inner_dimensions.volume() - state.used_volume).max(0);
+        possible = possible.min(count_with_capacity(volumes, free));
+    }
+    if let Some(weights) = &future.weights
+        && let Some(max_payload) = state.packed.container.max_payload
+    {
+        let free = (i128::from(max_payload.0) - i128::from(state.payload)).max(0);
+        possible = possible.min(count_with_capacity(weights, free));
+    }
+    unplaced_count + future.len - possible
+}
+
+/// Whether the request's objective fills volume before it counts pieces.
+pub(crate) fn ranks_by_volume(config: &PackingConfig) -> bool {
+    config.objective == "maximum_volume"
+}
+
+/// An upper bound on the volume a beam node can still end with: what is placed, plus the
+/// future items' total volume capped by the free space. Nominal volumes are not additive
+/// under nesting, so there the free space alone is the bound.
+fn reachable_volume(state: &ContainerState, future: &PrecomputedFuture) -> i128 {
+    if future.len == 0 {
+        return state.used_volume;
+    }
+    let free = (state.packed.container.inner_dimensions.volume() - state.used_volume).max(0);
+    let fillable = future
+        .volumes
+        .as_ref()
+        .and_then(|volumes| volumes.last())
+        .map_or(free, |total| free.min(*total));
+    state.used_volume + fillable
+}
+
+/// The numeric part of a container-plan beam node's order. Nodes whose ranks tie are
+/// ordered by their placement signature -- see `beam_order`.
+///
+/// One search builds one variant only, chosen by the objective, so the variant order
+/// never decides a comparison.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BeamRank {
+    /// Unpacked lower bound, unplaced count, placed count, stack top, used volume.
+    Pieces(usize, usize, Reverse<usize>, i128, Reverse<i128>),
+    /// `maximum_volume`: reachable volume, used volume, unplaced count, stack top.
+    Volume(Reverse<i128>, Reverse<i128>, usize, i128),
+}
+
+fn container_beam_rank(
+    node: &ContainerBeamNode,
+    future: &PrecomputedFuture,
+    by_volume: bool,
+) -> BeamRank {
+    if by_volume {
+        return BeamRank::Volume(
+            Reverse(reachable_volume(&node.state, future)),
+            Reverse(node.state.used_volume),
+            node.unplaced.len(),
+            node.state.packed.max_z_ticks(),
+        );
+    }
+    BeamRank::Pieces(
+        unpacked_lower_bound(&node.state, node.unplaced.len(), future),
+        node.unplaced.len(),
+        Reverse(node.state.packed.placements.len()),
+        node.state.packed.max_z_ticks(),
+        Reverse(node.state.used_volume),
+    )
+}
+
+/// The rank `node` would have once `pending` more items were added to its unplaced list,
+/// without cloning it to find out: with nothing left to come, the lower bound on unpacked
+/// items is exactly the unplaced count, and the reachable volume is exactly the used one.
+fn completed_beam_rank(node: &ContainerBeamNode, pending: usize, by_volume: bool) -> BeamRank {
+    let unplaced = node.unplaced.len() + pending;
+    if by_volume {
+        return BeamRank::Volume(
+            Reverse(node.state.used_volume),
+            Reverse(node.state.used_volume),
+            unplaced,
+            node.state.packed.max_z_ticks(),
+        );
+    }
+    BeamRank::Pieces(
+        unplaced,
+        unplaced,
+        Reverse(node.state.packed.placements.len()),
+        node.state.packed.max_z_ticks(),
+        Reverse(node.state.used_volume),
+    )
+}
+
+/// Orders two beam nodes exactly as 1.3.0's key did: rank first, then the byte order of the
+/// signature `id#seq@x,y,z|...` -- without ever building that string. Caching one string per
+/// expansion was what cost 1.3.0 its memory.
+fn beam_order(
+    rank: &BeamRank,
+    state: &ContainerState,
+    other_rank: &BeamRank,
+    other: &ContainerState,
+) -> Ordering {
+    rank.cmp(other_rank).then_with(|| {
+        compare_placement_signatures(&state.packed.placements, &other.packed.placements)
+    })
+}
+
+/// Byte order of two placement signatures. Placements that are structurally equal render
+/// identically, so a shared prefix is skipped without formatting; only the tails from the
+/// first difference are streamed, and the comparison almost always ends inside the first
+/// differing placement. The tails start without their `|`: both sides would emit it, or the
+/// side that has run out is the smaller either way.
+fn compare_placement_signatures(left: &[Placement], right: &[Placement]) -> Ordering {
+    let shared = left
+        .iter()
+        .zip(right)
+        .take_while(|(a, b)| same_signature_entry(a, b))
+        .count();
+    SignatureBytes::new(&left[shared..]).cmp(SignatureBytes::new(&right[shared..]))
+}
+
+fn same_signature_entry(left: &Placement, right: &Placement) -> bool {
+    left.instance.sequence == right.instance.sequence
+        && left.envelope_origin == right.envelope_origin
+        && left.instance.item.id == right.instance.item.id
+}
+
+/// The bytes of `id#seq@x,y,z` for each placement, joined with `|`, produced on demand.
+struct SignatureBytes<'a> {
+    placements: std::slice::Iter<'a, Placement>,
+    started: bool,
+    id: std::str::Bytes<'a>,
+    /// `#seq@x,y,z` of the current placement; five decimal integers fit in 96 bytes.
+    suffix: [u8; 96],
+    suffix_length: usize,
+    suffix_position: usize,
+    separator_pending: bool,
+}
+
+impl<'a> SignatureBytes<'a> {
+    fn new(placements: &'a [Placement]) -> Self {
+        Self {
+            placements: placements.iter(),
+            started: false,
+            id: "".bytes(),
+            suffix: [0; 96],
+            suffix_length: 0,
+            suffix_position: 0,
+            separator_pending: false,
+        }
+    }
+
+    fn load(&mut self, placement: &'a Placement) {
+        use std::io::Write;
+        let mut cursor = &mut self.suffix[..];
+        let origin = placement.envelope_origin;
+        write!(
+            cursor,
+            "#{}@{},{},{}",
+            placement.instance.sequence, origin.x, origin.y, origin.z
+        )
+        .expect("a usize and three i64 values need at most 84 of the 96 bytes");
+        self.suffix_length = 96 - cursor.len();
+        self.suffix_position = 0;
+        self.id = placement.instance.item.id.bytes();
+    }
+}
+
+impl Iterator for SignatureBytes<'_> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        loop {
+            if self.separator_pending {
+                self.separator_pending = false;
+                return Some(b'|');
+            }
+            if let Some(byte) = self.id.next() {
+                return Some(byte);
+            }
+            if self.suffix_position < self.suffix_length {
+                self.suffix_position += 1;
+                return Some(self.suffix[self.suffix_position - 1]);
+            }
+            let placement = self.placements.next()?;
+            self.load(placement);
+            self.separator_pending = self.started;
+            self.started = true;
+        }
+    }
+}
+
+fn group_member_indices(items: &[ItemInstance]) -> BTreeMap<&str, Vec<usize>> {
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, item) in items.iter().enumerate() {
+        if let Some(group) = item.item.group.as_deref() {
+            groups.entry(group).or_default().push(index);
+        }
+    }
+    groups
+}
+
+fn item_batches(items: &[ItemInstance]) -> Vec<Vec<ItemInstance>> {
+    let mut batches: Vec<Vec<ItemInstance>> = Vec::new();
+    let mut positions = BTreeMap::new();
+    for item in items {
+        if let Some(group) = item.item.group.as_deref() {
+            let position = *positions.entry(group).or_insert_with(|| {
+                batches.push(Vec::new());
+                batches.len() - 1
+            });
+            batches[position].push(item.clone());
+        } else {
+            batches.push(vec![item.clone()]);
+        }
+    }
+    batches
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_pack_into_beam(
+    container: &Container,
+    sequence: usize,
+    remaining: &[ItemInstance],
+    request: &PackingRequest,
+    constraints: &[Arc<dyn PlacementConstraint>],
+    scorers: &[Arc<dyn CandidateScorer>],
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+) -> (ContainerState, Vec<ItemInstance>) {
+    let batches = item_batches(remaining);
+    let (greedy_state, greedy_unplaced) = try_pack_into_greedy(
+        container,
+        sequence,
+        remaining,
+        request,
+        constraints,
+        scorers,
+        deadline,
+        metrics,
+    );
+    let initial = ContainerBeamNode {
+        state: ContainerState::new(container.clone(), sequence),
+        unplaced: Vec::new(),
+    };
+    let mut incumbent = ContainerBeamNode {
+        state: greedy_state,
+        unplaced: greedy_unplaced,
+    };
+    let mut beam = vec![initial];
+    let mut nodes = 0_usize;
+    let by_volume = ranks_by_volume(&request.config);
+    //: Which batch the loop stopped before, when it stopped early. The surviving beam
+    //: nodes have consumed batches `0..pending_from` and nothing after, so completing one
+    //: of them means adding `batches[pending_from..]` to its unplaced list -- see the
+    //: final selection below for why leaving that out lost items outright.
+    let mut incumbent_rank = completed_beam_rank(&incumbent, 0, by_volume);
+    let mut pending_from: Option<usize> = None;
+
+    for (position, batch) in batches.iter().enumerate() {
+        let future = batches[position + 1..]
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut expansions = Vec::new();
+        let mut exhausted = false;
+        for node in &beam {
+            if nodes >= request.config.container_plan_node_limit
+                || deadline.expired()
+                || deadline.effort_stops(request, metrics)
+            {
+                exhausted = true;
+                break;
+            }
+            nodes += 1;
+            metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
+            let mut children = Vec::new();
+            if batch.len() == 1 {
+                for candidate in find_candidates(
+                    &node.state,
+                    &batch[0],
+                    request,
+                    constraints,
+                    scorers,
+                    request.config.max_candidates_per_item,
+                    PointSet::Sparse,
+                    deadline,
+                    metrics,
+                ) {
+                    let mut state = branch(&node.state, 1);
+                    apply_candidate(&mut state, batch[0].clone(), &candidate);
+                    children.push(state);
+                }
+            } else {
+                let mut state = branch(&node.state, batch.len());
+                let mut accepted = true;
+                for item in batch {
+                    let candidates = find_candidates(
+                        &state,
+                        item,
+                        request,
+                        constraints,
+                        scorers,
+                        1,
+                        PointSet::Sparse,
+                        deadline,
+                        metrics,
+                    );
+                    if let Some(candidate) = candidates.first() {
+                        apply_candidate(&mut state, item.clone(), candidate);
+                    } else {
+                        accepted = false;
+                        break;
+                    }
+                }
+                if accepted {
+                    children.push(state);
+                }
+            }
+            for state in children {
+                expansions.push(ContainerBeamNode {
+                    state,
+                    unplaced: node.unplaced.clone(),
+                });
+            }
+            let mut skipped = node.unplaced.clone();
+            skipped.extend(batch.iter().cloned());
+            expansions.push(ContainerBeamNode {
+                state: node.state.clone(),
+                unplaced: skipped,
+            });
+        }
+        for node in &expansions {
+            let rank = completed_beam_rank(node, future.len(), by_volume);
+            if beam_order(&rank, &node.state, &incumbent_rank, &incumbent.state).is_lt() {
+                let mut complete = node.clone();
+                complete.unplaced.extend(future.iter().cloned());
+                incumbent = complete;
+                incumbent_rank = rank;
+            }
+        }
+        if expansions.is_empty() || exhausted {
+            pending_from = Some(position);
+            break;
+        }
+        let precomputed = PrecomputedFuture::new(&future, container.max_payload.is_some());
+        beam = best_beam_nodes(
+            expansions,
+            &precomputed,
+            request.config.container_plan_beam_width,
+            by_volume,
+        );
+    }
+    // Every node still in the beam has to account for the batches the loop never reached
+    // before it can be compared with the incumbent, or chosen over it.
+    //
+    // On a loop that ran to the end this changes nothing: the beam then holds expansions
+    // of the final batch, each of which was already compared above with an empty future,
+    // so `pending` is empty and the block is the no-op it always was. On a loop that
+    // stopped early -- deadline, `container_plan_node_limit`, or an exhausted effort
+    // budget, all three reachable through public configuration -- the beam holds nodes
+    // from *before* the current batch, and taking one without its tail returned a result
+    // that neither placed those items nor reported them unpacked. They simply
+    // disappeared: 112 requested, 43 placed, 0 unpacked, on a 3-type BR instance at
+    // `container_plan_node_limit: 4`. The engine's own independent validator caught the
+    // accounting hole and refused the whole request, so no wrong answer ever escaped --
+    // but a legal request failed outright, which is why this is a fix and not a tidy-up.
+    let pending: Vec<ItemInstance> = pending_from
+        .map(|from| batches[from..].iter().flatten().cloned().collect())
+        .unwrap_or_default();
+    let mut best: Option<(BeamRank, ContainerBeamNode)> = None;
+    for node in beam {
+        let rank = completed_beam_rank(&node, pending.len(), by_volume);
+        let better = best.as_ref().is_none_or(|(best_rank, best_node)| {
+            beam_order(&rank, &node.state, best_rank, &best_node.state).is_lt()
+        });
+        if better {
+            best = Some((rank, node));
+        }
+    }
+    if let Some((rank, mut completed)) = best
+        && beam_order(&rank, &completed.state, &incumbent_rank, &incumbent.state).is_lt()
+    {
+        completed.unplaced.extend(pending);
+        incumbent = completed;
+    }
+    (incumbent.state, incumbent.unplaced)
+}
+
+/// A copy of `state` with room for `placements` more placements.
+///
+/// A clone's placement vector is exactly full, so the first placement a beam child adds
+/// doubled it: every live expansion then held twice the placements it needed, and the
+/// expansions are the beam's peak. Reserving the exact room keeps a child at `p + k`
+/// placements instead of `2p`, for one copy of the vector the doubling made anyway.
+fn branch(state: &ContainerState, placements: usize) -> ContainerState {
+    let mut child = state.clone();
+    child.packed.placements.reserve_exact(placements);
+    child
+}
+
+/// The `width` best expansions in beam order, best first -- what a stable sort followed by a
+/// truncation would keep, in the same order. The expansion index is the final tie-break, which
+/// is exactly the order a stable sort leaves equal nodes in, so selecting the top `width`
+/// before sorting them cannot change the result; it only skips ordering the discarded tail.
+fn best_beam_nodes(
+    expansions: Vec<ContainerBeamNode>,
+    future: &PrecomputedFuture,
+    width: usize,
+    by_volume: bool,
+) -> Vec<ContainerBeamNode> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(BeamRank, usize)> = expansions
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (container_beam_rank(node, future, by_volume), index))
+        .collect();
+    let order = |(rank, index): &(BeamRank, usize), (other_rank, other): &(BeamRank, usize)| {
+        beam_order(
+            rank,
+            &expansions[*index].state,
+            other_rank,
+            &expansions[*other].state,
+        )
+        .then(index.cmp(other))
+    };
+    if ranked.len() > width {
+        ranked.select_nth_unstable_by(width - 1, order);
+        ranked.truncate(width);
+    }
+    ranked.sort_unstable_by(order);
+    let mut slots: Vec<Option<ContainerBeamNode>> = expansions.into_iter().map(Some).collect();
+    ranked
+        .into_iter()
+        .filter_map(|(_, index)| slots[index].take())
+        .collect()
+}
+
+/// Ratios in the objective vector are expressed as parts per million so the whole
+/// vector stays exactly comparable across languages.
+pub(crate) const SCORE_SCALE: i128 = 1_000_000;
+
+pub(crate) fn dimensional_weight_ticks(container: &Container, config: &PackingConfig) -> i128 {
+    dimensional_weight_of(
+        container
+            .outer_dimensions
+            .unwrap_or(container.inner_dimensions),
+        config,
+    )
+}
+
+/// What a carrier bills by volume for this container as filled: a flat bag's achieved
+/// package (empty: nothing), which only grows as items are added and so also bounds any
+/// completion from below, else the declared outer size. `O(p)` for a bag.
+pub(crate) fn billed_dimensional_weight(packed: &PackedContainer, config: &PackingConfig) -> i128 {
+    dimensional_weight_of(packed.billed_dimensions(), config)
+}
+
+fn dimensional_weight_of(dimensions: Dimensions, config: &PackingConfig) -> i128 {
+    let length_ticks_per_unit = match config.dimensional_weight_length_unit.as_str() {
+        "mm" => Length::TICKS_PER_MM as i128,
+        "cm" => (Length::TICKS_PER_MM * 10) as i128,
+        "m" => (Length::TICKS_PER_MM * 1_000) as i128,
+        "in" => Length::TICKS_PER_INCH as i128,
+        "ft" => (Length::TICKS_PER_INCH * 12) as i128,
+        _ => unreachable!("configuration units are validated at admission"),
+    };
+    let weight_ticks_per_unit = match config.dimensional_weight_weight_unit.as_str() {
+        "mg" => Weight::TICKS_PER_MG as i128,
+        "g" => Weight::TICKS_PER_G as i128,
+        "kg" => Weight::TICKS_PER_KG as i128,
+        "oz" => Weight::TICKS_PER_OZ as i128,
+        "lb" => Weight::TICKS_PER_LB as i128,
+        _ => unreachable!("configuration units are validated at admission"),
+    };
+    dimensions.volume() * weight_ticks_per_unit
+        / (length_ticks_per_unit.pow(3)
+            * config
+                .dimensional_weight_divisor
+                .expect("shipping_cost divisor is validated at admission"))
+}
+
+/// The first container in a finished answer whose own rate table cannot price it, as
+/// `(container id, billed grams, last bracket)`.
+///
+/// Ranking an unpriceable candidate worst is what makes a priceable alternative win the
+/// round; it is a search device, not an answer. This is the guard that keeps the sentinel
+/// from ever surfacing: a returned packing the tariff cannot price would quote a number
+/// the carrier never published, which is the one outcome `charge_minor` refuses to
+/// invent. Callers turn a hit into the same refusal Python and PHP raise.
+pub(crate) fn unpriceable_container(
+    containers: &[PackedContainer],
+    config: &PackingConfig,
+) -> Option<(String, i64, i64)> {
+    if config.objective != "lowest_landed_cost" {
+        return None;
+    }
+    containers.iter().find_map(|packed| {
+        let dimensional = billed_dimensional_weight(packed, config);
+        let billed = i128::from(packed.gross_weight().0).max(dimensional);
+        let grams = RateTable::grams(billed as i64);
+        // A container with no table at all is refused at admission, so `parse_request`
+        // callers never reach this arm -- but `pack_request_with_policy` is public, and a
+        // Rust consumer assembling a `PackingRequest` by hand bypasses that check. Report
+        // it rather than skipping it: an untabled container is the one case where "cannot
+        // price" is certain. Python and PHP report the same `0` bracket here.
+        let Some(table) = packed.container.rate_table.as_ref() else {
+            return Some((packed.container.id.clone(), grams, 0));
+        };
+        if table.charge_minor(grams).is_some() {
+            return None;
+        }
+        let last = table.weight_brackets_g.last().copied().unwrap_or(0);
+        Some((packed.container.id.clone(), grams, last))
+    })
+}
+
+/// How good opening this container type would be, ranked the way the finished result
+/// will be ranked.
+///
+/// The previous key led with the number of items placed, so the requested objective was
+/// only a tie-break: under `lowest_cost` a container that held one more item beat any
+/// saving, however large, and Rust paid four times what Python paid on
+/// `regression-smallest-sufficient-container` -- a fixture that exists to assert the
+/// cheapest sufficient container is chosen. The terms below are the same ones
+/// `score_solution` uses, assembled in the same order that objective puts them, so the
+/// per-round choice and the final score cannot disagree about what "better" means.
+///
+/// `shipping_cost` deserves its own note: the old key ranked by the container's
+/// *dimensional* weight while the score charges `max(gross, dimensional)`, the billable
+/// weight. Selection optimised a figure nobody is charged whenever actual weight won.
+fn container_selection_key(
+    state: &ContainerState,
+    remaining_after: usize,
+    remaining_before: usize,
+    config: &PackingConfig,
+) -> (Vec<i128>, String) {
+    let packed = &state.packed;
+    let container = &packed.container;
+    let inner = container.inner_dimensions;
+    let volume = inner.volume();
+    let placed = (remaining_before - remaining_after) as i128;
+
+    // How many copies of this template would finish the remaining items, which is this
+    // choice's contribution to `container_count`. Zero-placed trials never reach here.
+    // Written out rather than via `div_ceil`, which is still unstable for `i128`. Both
+    // operands are positive here, so the usual round-up form is exact.
+    let per_container = placed.max(1);
+    let containers_needed = (remaining_before as i128 + per_container - 1) / per_container;
+    let cost = container.cost_minor as i128;
+    let top = packed.max_z_ticks();
+    let unused_ppm = if volume > 0 {
+        (volume - packed.used_volume()) * SCORE_SCALE / volume
+    } else {
+        0
+    };
+    let inner_height = inner.height.0 as i128;
+    let height_ppm = if inner_height > 0 {
+        top * SCORE_SCALE / inner_height
+    } else {
+        0
+    };
+    let billable =
+        if config.objective == "shipping_cost" || config.objective == "lowest_landed_cost" {
+            i128::from(packed.gross_weight().0).max(billed_dimensional_weight(packed, config))
+        } else {
+            0
+        };
+    // The greedy loop commits this trial verbatim -- nothing is added to the container
+    // after it wins the round -- so its billed weight is final here and the tariff can be
+    // read now. `charge_minor` is a bracket walk over a table with a handful of entries,
+    // so pricing every trial costs nothing the round did not already spend packing it.
+    let landed = if config.objective == "lowest_landed_cost" {
+        container
+            .rate_table
+            .as_ref()
+            .and_then(|table| table.charge_minor(RateTable::grams(billable as i64)))
+            .map_or(i128::MAX, i128::from)
+    } else {
+        0
+    };
+
+    // `-placed` sits after the objective's *decisive* keys and before its two ratio
+    // keys, and the position is deliberate. Container count and cost are what the
+    // objective actually optimises, so they lead. Unused volume and stack height are its
+    // two lowest-priority keys, and optimising them greedily one container at a time is
+    // speculative -- filling this box tightest can leave an awkward remainder for the
+    // next. Placing more is the sounder proxy for finishing in fewer containers, and
+    // putting it after the ratio keys measurably regressed
+    // `regression-cumulative-weight-never-exceeds-max-payload`.
+    let key = match config.objective.as_str() {
+        "lowest_cost" => vec![cost, containers_needed, -placed, unused_ppm, height_ppm],
+        "shipping_cost" => vec![billable, containers_needed, -placed, unused_ppm, height_ppm],
+        // Landed cost ranks by the money `score_solution` will actually charge for this
+        // container, not by the billed weight it is derived from. The two order
+        // candidates identically only while price rises smoothly with weight; a bracket
+        // step or a minimum charge makes the cheaper shipment the heavier one, and an
+        // unpriceable trial is not merely expensive but unshippable, so it sorts behind
+        // every priceable alternative rather than winning on being light.
+        "lowest_landed_cost" => vec![landed, containers_needed, -placed, unused_ppm, height_ppm],
+        "open_dimension_height" => vec![top, containers_needed, cost, -placed, unused_ppm],
+        // `maximum_volume` ranks by the volume left behind, so the round keeps the trial
+        // that loaded the most volume, not the one that seated the most pieces.
+        "maximum_volume" => vec![
+            -state.used_volume,
+            containers_needed,
+            cost,
+            unused_ppm,
+            height_ppm,
+        ],
+        // `maximum_value` ranks by value forgone, which is a property of what is left
+        // unpacked overall rather than of the container being opened, so a per-round
+        // choice cannot see it. Item ordering is where that objective is served; this
+        // falls back to the default order rather than pretending otherwise.
+        _ => vec![containers_needed, cost, -placed, unused_ppm, height_ppm],
+    };
+    (key, container.id.clone())
+}
+
+pub fn container_order_key(
+    container: &Container,
+    config: &PackingConfig,
+) -> (i128, i64, i128, String) {
+    let primary = if config.objective == "shipping_cost" || config.objective == "lowest_landed_cost"
+    {
+        dimensional_weight_ticks(container, config)
+    } else {
+        container.cost_minor as i128
+    };
+    (
+        primary,
+        container.cost_minor,
+        container.inner_dimensions.volume(),
+        container.id.clone(),
+    )
+}
+
+/// Canonical objective vector — see `docs/OBJECTIVE.md`.
+///
+/// Five lexicographic keys, ascending, lower is better. Every key is an exact integer:
+/// the ratios are floored per container in `i128` rather than computed in floating
+/// point, so Python, PHP, Rust and the JavaScript fallback all agree bit-for-bit.
+pub fn score_solution(
+    containers: &[PackedContainer],
+    unpacked: &[UnpackedItem],
+    config: &PackingConfig,
+) -> Vec<i128> {
+    let mut unused = 0_i128;
+    let mut height = 0_i128;
+    let mut billable = 0_i128;
+    let mut landed = 0_i128;
+    let mut achieved_height = 0_i128;
+
+    for packed in containers {
+        let inner = packed.container.inner_dimensions;
+
+        let volume = inner.volume();
+        if volume > 0 {
+            unused += (volume - packed.used_volume()) * SCORE_SCALE / volume;
+        }
+
+        let top = packed.max_z_ticks();
+        achieved_height += top;
+        let inner_height = inner.height.0 as i128;
+        if inner_height > 0 {
+            height += top * SCORE_SCALE / inner_height;
+        }
+
+        if config.objective == "shipping_cost" || config.objective == "lowest_landed_cost" {
+            let dimensional = billed_dimensional_weight(packed, config);
+            let billed = i128::from(packed.gross_weight().0).max(dimensional);
+            billable += billed;
+            if config.objective == "lowest_landed_cost" {
+                // A container with no table, or a weight past the last bracket, cannot be
+                // priced. Ranking it as free would make the objective prefer exactly the
+                // packing the caller cannot ship, so the run is scored as the worst
+                // possible answer instead -- the same effect Python and PHP get by
+                // refusing outright, reached without giving this function a fallible
+                // signature every other objective would have to carry.
+                landed = match packed
+                    .container
+                    .rate_table
+                    .as_ref()
+                    .and_then(|table| table.charge_minor(RateTable::grams(billed as i64)))
+                {
+                    Some(charge) => landed.saturating_add(i128::from(charge)),
+                    None => i128::MAX,
+                };
+            }
+        }
+    }
+
+    let default = vec![
+        unpacked.len() as i128,
+        containers.len() as i128,
+        containers
+            .iter()
+            .map(|container| container.container.cost_minor as i128)
+            .sum(),
+        unused,
+        height,
+    ];
+    if config.objective == "lowest_cost" {
+        vec![default[0], default[2], default[1], default[3], default[4]]
+    } else if config.objective == "shipping_cost" {
+        vec![default[0], billable, default[1], default[3], default[4]]
+    } else if config.objective == "lowest_landed_cost" {
+        vec![default[0], landed, default[1], default[3], default[4]]
+    } else if config.objective == "open_dimension_height" {
+        vec![
+            default[0],
+            achieved_height,
+            default[1],
+            default[2],
+            default[3],
+        ]
+    } else if config.objective == "maximum_value" {
+        // Ranks by the total declared value of unpacked items ahead of
+        // container count, cost and unused volume. `unpacked_count` still leads --
+        // no selectable trade-off may prefer an incomplete answer over a complete
+        // one -- this only tie-breaks among solutions that leave the same *number*
+        // of items unpacked but not the same *value* forgone.
+        let value_forgone: i128 = unpacked
+            .iter()
+            .map(|item| item.instance.item.value.unwrap_or(0) as i128)
+            .sum();
+        vec![
+            default[0],
+            value_forgone,
+            default[1],
+            default[2],
+            default[3],
+        ]
+    } else if ranks_by_volume(config) {
+        // Volume left behind leads and the piece count follows. The share is rounded up,
+        // so an incomplete answer never scores zero and a complete one still beats it --
+        // the guarantee `unpacked_count` gives the other objectives by leading them.
+        vec![
+            unpacked_volume_ppm(containers, unpacked),
+            default[0],
+            default[1],
+            default[2],
+            default[3],
+        ]
+    } else {
+        default
+    }
+}
+
+/// `ceil(unpacked volume x 10^6 / requested volume)` in nominal item volume, zero when
+/// nothing was requested. A ratio rather than the raw volume because cubic ticks
+/// overflow a 64-bit integer for an ordinary freight container; `i128` carries the
+/// products exactly. O(n) for `n` item instances.
+fn unpacked_volume_ppm(containers: &[PackedContainer], unpacked: &[UnpackedItem]) -> i128 {
+    let unpacked_volume = unpacked
+        .iter()
+        .map(|item| item.instance.item.dimensions.volume())
+        .sum::<i128>();
+    let packed_volume = containers.iter().map(nominal_item_volume).sum::<i128>();
+    volume_share_ppm(unpacked_volume, unpacked_volume + packed_volume)
+}
+
+/// `ceil(part x 10^6 / whole)`, zero for an empty whole.
+pub(crate) fn volume_share_ppm(part: i128, whole: i128) -> i128 {
+    if whole <= 0 {
+        return 0;
+    }
+    (part * SCORE_SCALE + whole - 1) / whole
+}
+
+/// The declared volume of every item a container holds. The compact lattice keeps its
+/// instances apart from `placements`, which stays empty for it.
+fn nominal_item_volume(packed: &PackedContainer) -> i128 {
+    if !packed.lattice_items.is_empty() {
+        return packed
+            .lattice_items
+            .iter()
+            .map(|instance| instance.item.dimensions.volume())
+            .sum();
+    }
+    packed
+        .placements
+        .iter()
+        .map(|placement| placement.instance.item.dimensions.volume())
+        .sum()
+}
+
+pub(super) fn explain_unfit(request: &PackingRequest, item: &ItemInstance) -> String {
+    let fits_with = |rotations: &[Rotation]| {
+        request.containers.iter().any(|container| {
+            item.item
+                .dimensions
+                .unique_rotations(rotations)
+                .iter()
+                .any(|(_, dimensions)| {
+                    container.fits_alone(dimensions.expand(request.config.clearance))
+                })
+        })
+    };
+    // Same geometric check with every physical orientation allowed, not only the
+    // item's own restricted set: distinguishes "genuinely too big in any rotation"
+    // from "this exact rotation restriction, and only it, rules every container out"
+    //. Both are pure geometry, so both are provable without a complete
+    // search.
+    if !fits_with(&Rotation::ALL) {
+        "no_compatible_container_dimensions".into()
+    } else if !fits_with(&item.item.allowed_rotations) {
+        "rotation_restricted".into()
+    } else if request.containers.iter().all(|container| {
+        container
+            .max_payload
+            .map(|maximum| item.item.weight.0 > maximum.0)
+            .unwrap_or(false)
+    }) {
+        "payload_exceeded".into()
+    } else if !item.item.eligible_container_tags.is_empty()
+        && request.containers.iter().all(|container| {
+            item.item
+                .eligible_container_tags
+                .is_disjoint(&container.tags)
+        })
+    {
+        "no_eligible_container".into()
+    } else {
+        "search_exhausted".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn axle_points_already_offered_are_not_offered_again() {
+        let point = |x, y| Point { x, y, z: 0 };
+        let mut points = vec![point(0, 0), point(5, 0), point(0, 5)];
+        append_unseen(
+            &mut points,
+            vec![
+                point(7, 0),
+                point(5, 0),
+                point(7, 5),
+                point(7, 0),
+                point(0, 5),
+            ],
+        );
+        assert_eq!(
+            points,
+            [
+                point(0, 0),
+                point(5, 0),
+                point(0, 5),
+                point(7, 0),
+                point(7, 5)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_running_flat_bag_extent_equals_the_extent_from_scratch() {
+        // A fixed-seed linear congruential sequence: the property is checked over many
+        // random scenes without making the suite depend on a random source.
+        let mut seed = 2602_u64;
+        let mut next = |bound: i64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            1 + (seed >> 33) as i64 % bound
+        };
+        for _ in 0..200 {
+            let boxes = (0..next(12))
+                .map(|_| Aabb {
+                    origin: Point {
+                        x: next(5_000),
+                        y: next(5_000),
+                        z: next(5_000),
+                    },
+                    dimensions: Dimensions {
+                        length: Length(next(5_000)),
+                        width: Length(next(5_000)),
+                        height: Length(next(5_000)),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let mut running = [0, 0, 0];
+            let mut verdicts = Vec::new();
+            for envelope in &boxes {
+                running = grown_extent(running, *envelope);
+                let [a, b, c] = running;
+                verdicts.push(a + c <= 12_000 && b + c <= 12_000);
+            }
+            let scratch = boxes.iter().fold([0, 0, 0], |[a, b, c], envelope| {
+                [
+                    a.max(envelope.x2()),
+                    b.max(envelope.y2()),
+                    c.max(envelope.z2()),
+                ]
+            });
+            assert_eq!(running, scratch);
+            // Extents only grow, so a refused prefix is never admitted again.
+            assert!(verdicts.windows(2).all(|pair| pair[0] || !pair[1]));
+        }
+    }
+
+    #[test]
+    fn prefix_sum_count_is_the_largest_cardinality_the_resource_admits() {
+        let cases: [&[i128]; 4] = [&[2, 3, 5], &[1, 4, 4, 9], &[3, 3, 3, 7, 8], &[0, 0, 2, 6]];
+        for costs in cases {
+            let prefix = cumulative(costs.iter().copied());
+            for capacity in 0..=costs.iter().sum::<i128>() {
+                let exact = (0_u32..1 << costs.len())
+                    .filter(|mask| {
+                        (0..costs.len())
+                            .filter(|bit| mask & (1 << bit) != 0)
+                            .map(|bit| costs[bit])
+                            .sum::<i128>()
+                            <= capacity
+                    })
+                    .map(|mask| mask.count_ones() as usize)
+                    .max()
+                    .unwrap_or(0);
+                assert_eq!(count_with_capacity(&prefix, capacity), exact);
+            }
+        }
+    }
+
+    fn wedge(id: &str, side: i64, upper: bool) -> ItemInstance {
+        let base = if upper {
+            [[side, side], [side, 0], [0, side]]
+        } else {
+            [[0, 0], [side, 0], [0, side]]
+        };
+        let mut wedge = item(id);
+        wedge.dimensions = dimensions(side, side, side);
+        wedge.allowed_rotations = vec![Rotation::Lwh];
+        wedge.shape_type = ShapeType::ConvexHull;
+        wedge.hull_vertices = Some(
+            [0, side]
+                .iter()
+                .flat_map(|&z| base.iter().map(move |&[x, y]| [x, y, z]))
+                .collect(),
+        );
+        ItemInstance {
+            item: wedge,
+            sequence: 1,
+        }
+    }
+
+    #[test]
+    fn the_beam_ordering_bound_lets_the_second_wedge_fit() {
+        // With one wedge placed, half the crate is free and the other wedge occupies
+        // exactly that half. Its declared box is the whole crate, and counting that against
+        // occupied free space claimed it could never fit.
+        let side = 1_000;
+        let mut state = ContainerState::new(container(), 1);
+        let mut lower = candidate(0, Point::ZERO, Rotation::Lwh, 1.0);
+        lower.dimensions = dimensions(side, side, side);
+        lower.envelope_dimensions = lower.dimensions;
+        apply_candidate(&mut state, wedge("lower", side, false), &lower);
+        assert_eq!(state.used_volume, i128::from(side * side * side / 2));
+        let future = PrecomputedFuture::new(&[wedge("upper", side, true)], false);
+        assert_eq!(unpacked_lower_bound(&state, 0, &future), 0);
+    }
+
+    #[test]
+    fn a_beam_child_holds_only_the_placements_it_adds() {
+        // A clone's vector is exactly full, and the child's first push used to
+        // double it, so each live expansion carried twice the placements it needed.
+        let mut parent = ContainerState::new(container(), 1);
+        for index in 0..5 {
+            let origin = Point {
+                x: index * 10,
+                y: 0,
+                z: 0,
+            };
+            let instance = ItemInstance {
+                item: item("box"),
+                sequence: index as usize,
+            };
+            apply_candidate(
+                &mut parent,
+                instance,
+                &candidate(0, origin, Rotation::Lwh, 1.0),
+            );
+        }
+        let mut child = branch(&parent, 1);
+        let next = ItemInstance {
+            item: item("box"),
+            sequence: 5,
+        };
+        let origin = Point { x: 50, y: 0, z: 0 };
+        apply_candidate(&mut child, next, &candidate(0, origin, Rotation::Lwh, 1.0));
+        assert_eq!(child.packed.placements.len(), 6);
+        assert_eq!(child.packed.placements.capacity(), 6);
+    }
+
+    #[test]
+    fn the_container_plan_bound_counts_a_wedge_pair_as_one_crate() {
+        // Two wedges that fill one crate between them have boxes worth two crates.
+        // Counted by box, the plan bound said a second crate was unavoidable.
+        let side = 1_000;
+        let pair = [wedge("lower", side, false), wedge("upper", side, true)];
+        let mut crate_ = container();
+        crate_.quantity = Some(2);
+        let request = request(&pair[0].item, &crate_, None);
+        let plan = OpenedContainers {
+            packed: Vec::new(),
+            remaining: pair.to_vec(),
+            inventory: BTreeMap::from([(crate_.id.clone(), Some(2))]),
+            sequences: BTreeMap::new(),
+        };
+        assert_eq!(additional_container_lower_bound(&plan, &request), 1);
+    }
+
+    #[test]
+    fn the_unpacked_volume_share_rounds_up_and_is_zero_only_when_nothing_is_left() {
+        // A 40 ft container in micrometre ticks: past `i64`, inside `i128`.
+        let freight = 12_000_000_i128 * 2_300_000 * 2_400_000;
+        assert!(freight > i128::from(i64::MAX));
+
+        assert_eq!(volume_share_ppm(0, 0), 0);
+        assert_eq!(volume_share_ppm(0, freight), 0);
+        assert_eq!(volume_share_ppm(1, freight), 1);
+        assert_eq!(volume_share_ppm(1, 3), 333_334);
+        assert_eq!(volume_share_ppm(freight / 2, freight), 500_000);
+        assert_eq!(volume_share_ppm(freight, freight), SCORE_SCALE);
+    }
+
+    fn dimensions(length: i64, width: i64, height: i64) -> Dimensions {
+        Dimensions {
+            length: Length(length),
+            width: Length(width),
+            height: Length(height),
+        }
+    }
+
+    fn candidate(score: i128, origin: Point, rotation: Rotation, support_ratio: f64) -> Candidate {
+        let dimensions = dimensions(10, 20, 30);
+        Candidate {
+            envelope_origin: origin,
+            position: origin,
+            rotation,
+            dimensions,
+            envelope_dimensions: dimensions,
+            support_ratio,
+            score,
+        }
+    }
+
+    fn candidate_fingerprint(
+        candidate: &Candidate,
+    ) -> (CandidateOrderKey, u64, Dimensions, Dimensions) {
+        (
+            candidate_order_key(candidate),
+            candidate.support_ratio.to_bits(),
+            candidate.dimensions,
+            candidate.envelope_dimensions,
+        )
+    }
+
+    fn reference_selection(mut candidates: Vec<Candidate>, limit: usize) -> Vec<Candidate> {
+        candidates.sort_by_key(candidate_order_key);
+        candidates.truncate(limit.max(1));
+        candidates
+    }
+
+    fn bounded_selection(candidates: Vec<Candidate>, limit: usize) -> Vec<Candidate> {
+        let mut selected = CandidateAccumulator::new(limit);
+        for candidate in candidates {
+            selected.push(candidate);
+        }
+        selected.finish()
+    }
+
+    #[test]
+    fn bounded_candidate_selection_matches_the_full_stable_sort() {
+        let candidates = vec![
+            candidate(9, Point { x: 8, y: 0, z: 0 }, Rotation::Lwh, 0.1),
+            candidate(2, Point { x: 4, y: 0, z: 0 }, Rotation::Wlh, 0.2),
+            // Same public ordering key, deliberately different marker. The bounded
+            // collector must preserve the stable first-seen order of the full sort.
+            candidate(2, Point { x: 4, y: 0, z: 0 }, Rotation::Wlh, 0.3),
+            candidate(1, Point { x: 9, y: 0, z: 0 }, Rotation::Lwh, 0.4),
+            candidate(2, Point { x: 1, y: 0, z: 0 }, Rotation::Hwl, 0.5),
+            candidate(7, Point { x: 0, y: 2, z: 0 }, Rotation::Lhw, 0.6),
+        ];
+
+        for limit in [0, 1, 3, 8, usize::MAX] {
+            let expected = reference_selection(candidates.clone(), limit)
+                .iter()
+                .map(candidate_fingerprint)
+                .collect::<Vec<_>>();
+            let actual = bounded_selection(candidates.clone(), limit)
+                .iter()
+                .map(candidate_fingerprint)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "limit={limit}");
+        }
+    }
+
+    #[test]
+    fn far_corner_y_outranks_any_x_on_a_long_container() {
+        // 12.5 m along x against 1 mm along y: a weighted `y2 * 1e4 + x2` ranks the
+        // deeper candidate first, the lexicographic key does not.
+        let long_way = candidate(
+            0,
+            Point {
+                x: 200_000_000,
+                y: 0,
+                z: 0,
+            },
+            Rotation::Lwh,
+            1.0,
+        );
+        let one_mm_deeper = candidate(
+            0,
+            Point {
+                x: 0,
+                y: 16_000,
+                z: 0,
+            },
+            Rotation::Lwh,
+            1.0,
+        );
+        let higher = candidate(0, Point { x: 0, y: 0, z: 1 }, Rotation::Lwh, 1.0);
+        let favoured = candidate(
+            -1,
+            Point {
+                x: 0,
+                y: 0,
+                z: 16_000,
+            },
+            Rotation::Lwh,
+            1.0,
+        );
+        let mut ranked = [higher, one_mm_deeper, long_way, favoured];
+        ranked.sort_by_key(candidate_order_key);
+        let origins: Vec<Point> = ranked.iter().map(|c| c.envelope_origin).collect();
+        assert_eq!(
+            origins,
+            vec![
+                Point {
+                    x: 0,
+                    y: 0,
+                    z: 16_000
+                },
+                Point {
+                    x: 200_000_000,
+                    y: 0,
+                    z: 0
+                },
+                Point {
+                    x: 0,
+                    y: 16_000,
+                    z: 0
+                },
+                Point { x: 0, y: 0, z: 1 },
+            ]
+        );
+    }
+
+    fn item(id: &str) -> Item {
+        Item {
+            id: id.into(),
+            dimensions: dimensions(10, 20, 30),
+            weight: Weight(0),
+            quantity: 1,
+            allowed_rotations: Rotation::ALL.to_vec(),
+            stackable: true,
+            must_be_on_floor: false,
+            max_top_load: None,
+            minimum_support_ratio: 0.0,
+            group: None,
+            tags: BTreeSet::new(),
+            incompatible_tags: BTreeSet::new(),
+            priority: 0,
+            metadata: BTreeMap::new(),
+            nesting_height: None,
+            max_stacked_items: None,
+            ground_contact_rule: None,
+            stop_index: None,
+            eligible_container_tags: BTreeSet::new(),
+            value: None,
+            shape_type: crate::geometry::ShapeType::RigidCuboid,
+            hull_vertices: None,
+            compression_ratio_ppm: None,
+            max_compression_pressure_kpa: None,
+            stacking_group: None,
+            accepts_stacking_groups: Default::default(),
+        }
+    }
+
+    #[test]
+    fn group_batches_preserve_first_appearance_and_member_order() {
+        let groups = [
+            Some("00"),
+            None,
+            Some("0"),
+            Some("00"),
+            Some("1"),
+            Some("0"),
+            None,
+            Some("1"),
+        ];
+        let items = groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                let mut value = item(&index.to_string());
+                value.group = group.map(str::to_owned);
+                ItemInstance {
+                    item: value,
+                    sequence: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let batches = item_batches(&items)
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|instance| instance.item.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches,
+            vec![
+                vec!["0", "3"],
+                vec!["1"],
+                vec!["2", "5"],
+                vec!["4", "7"],
+                vec!["6"]
+            ]
+        );
+        let indices = group_member_indices(&items);
+        assert_eq!(indices["00"], vec![0, 3]);
+        assert_eq!(indices["0"], vec![2, 5]);
+        assert_eq!(indices["1"], vec![4, 7]);
+        assert_eq!(indices.len(), 3);
+        assert!(item_batches(&[]).is_empty());
+        assert!(group_member_indices(&[]).is_empty());
+    }
+
+    fn container() -> Container {
+        Container {
+            id: "box".into(),
+            inner_dimensions: dimensions(1_000, 1_000, 1_000),
+            outer_dimensions: None,
+            tare_weight: Weight(0),
+            max_payload: None,
+            cost_minor: 0,
+            quantity: Some(1),
+            obstacles: Vec::new(),
+            tags: BTreeSet::new(),
+            max_items: None,
+            metadata: BTreeMap::new(),
+            axles: None,
+            void_fill_reserve_ppm: 0,
+            tag_limits: BTreeMap::new(),
+            max_stack_density: None,
+            rate_table: None,
+            access_directions: Vec::new(),
+            preloaded: Vec::new(),
+            deformable_boundary: None,
+            made_to_measure: None,
+        }
+    }
+
+    fn request(
+        item: &Item,
+        container: &Container,
+        effort_budget: Option<EffortBudget>,
+    ) -> PackingRequest {
+        let config = PackingConfig {
+            time_limit_ms: 60_000,
+            effort_budget,
+            ..Default::default()
+        };
+        PackingRequest {
+            items: vec![item.clone()],
+            containers: vec![container.clone()],
+            config,
+            output_length_unit: "ticks".into(),
+            output_weight_unit: "ticks".into(),
+            catalog_versions_used: Vec::new(),
+            fixed_placements: Vec::new(),
+            fixed_containers: Vec::new(),
+        }
+    }
+
+    /// Every instance the beam was handed comes back either placed or unplaced.
+    ///
+    /// The invariant is the whole contract of `try_pack_into_beam`'s return value, and it
+    /// held only while the loop ran to the end. On an early stop -- a node limit here, a
+    /// deadline or an exhausted effort budget in the field -- the surviving beam nodes
+    /// still had every unvisited batch missing from their unplaced list, and choosing one
+    /// of them dropped those items on the floor. It is asserted with a *node limit*
+    /// rather than a short deadline on purpose: this is a counted, clock-free reproduction
+    /// that cannot go quiet on a fast host, and `container_plan_node_limit` is public
+    /// configuration, so the hole was reachable without any timing at all.
+    /// The same accounting invariant, across every shape that reaches the early stop.
+    ///
+    /// The regression test below pins one scene, because one scene is what it took to
+    /// reproduce the defect. That leaves the invariant asserted on a single arrangement of
+    /// item size, beam width and node limit -- and the defect it was written for had
+    /// survived three releases precisely because nobody had varied those.
+    ///
+    /// A node limit of zero and a beam width of one are the two configurations most likely
+    /// to be wrong and least likely to be typed: zero stops the loop before any expansion
+    /// exists, and one leaves the beam holding only its initial empty node.
+    #[test]
+    fn the_beam_accounts_for_every_instance_across_widths_and_limits() {
+        for (extent, width, limit, count) in [
+            (600_i64, 1_usize, 0_usize, 5_usize), // stops before the first expansion
+            (600, 1, 1, 5),
+            (600, 4, 0, 12),
+            (600, 4, 3, 12),
+            (600, 16, 100, 12), // never stops early at all
+            (10, 4, 3, 12),     // everything fits; the incumbent is complete
+            (600, 4, 3, 1),     // one instance, one batch
+            (600, 4, 3, 2),
+        ] {
+            let mut item_type = item("beamed");
+            item_type.dimensions = dimensions(extent, extent, extent);
+            let instances = (1..=count as u32)
+                .map(|sequence| ItemInstance {
+                    item: item_type.clone(),
+                    sequence: sequence as usize,
+                })
+                .collect::<Vec<_>>();
+            let mut request = request(&item_type, &container(), None);
+            request.config.container_plan_beam_width = width;
+            request.config.container_plan_node_limit = limit;
+
+            let mut metrics = SolverMetrics::default();
+            let (state, unplaced) = try_pack_into_beam(
+                &container(),
+                1,
+                &instances,
+                &request,
+                &[],
+                &[],
+                &Deadline::new(request.config.time_limit_ms),
+                &mut metrics,
+            );
+
+            let mut seen = state
+                .packed
+                .placements
+                .iter()
+                .map(|placement| placement.instance.id())
+                .collect::<BTreeSet<_>>();
+            seen.extend(unplaced.iter().map(ItemInstance::id));
+            assert_eq!(
+                seen,
+                instances
+                    .iter()
+                    .map(ItemInstance::id)
+                    .collect::<BTreeSet<_>>(),
+                "extent {extent}, width {width}, limit {limit}, {count} instances: an \
+                 instance was lost, reported twice, or invented",
+            );
+            assert_eq!(
+                state.packed.placements.len() + unplaced.len(),
+                instances.len(),
+                "extent {extent}, width {width}, limit {limit}, {count} instances",
+            );
+        }
+    }
+
+    /// The item types the beam placed when offered one large box, then eight small ones
+    /// that only fit without it.
+    fn beam_choice_between_one_large_and_eight_small(objective: &str) -> Vec<String> {
+        let mut large = item("large");
+        large.dimensions = dimensions(1_000, 1_000, 900);
+        let mut small = item("small");
+        small.dimensions = dimensions(400, 400, 400);
+        let mut instances = vec![ItemInstance {
+            item: large.clone(),
+            sequence: 1,
+        }];
+        instances.extend((1..=8).map(|sequence| ItemInstance {
+            item: small.clone(),
+            sequence,
+        }));
+        let mut request = request(&large, &container(), None);
+        request.config.container_plan_beam_width = 4;
+        request.config.container_plan_node_limit = 100;
+        request.config.objective = objective.into();
+
+        let (state, unplaced) = try_pack_into_beam(
+            &container(),
+            1,
+            &instances,
+            &request,
+            &[],
+            &[],
+            &Deadline::new(request.config.time_limit_ms),
+            &mut SolverMetrics::default(),
+        );
+
+        assert_eq!(state.packed.placements.len() + unplaced.len(), 9);
+        state
+            .packed
+            .placements
+            .iter()
+            .map(|placement| placement.instance.item.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_container_beam_ranks_by_volume_only_under_the_volume_objective() {
+        // Skipping the large box seats eight pieces and leaves one; keeping it seats one
+        // piece of 900 000 000 against their 512 000 000. Each objective takes its own.
+        assert_eq!(
+            beam_choice_between_one_large_and_eight_small("default"),
+            ["small"; 8]
+        );
+        assert_eq!(
+            beam_choice_between_one_large_and_eight_small("maximum_volume"),
+            ["large"]
+        );
+    }
+
+    #[test]
+    fn the_container_beam_accounts_for_every_instance_when_it_stops_early() {
+        // Deliberately too large to share the container: only one instance fits, so the
+        // greedy incumbent carries eleven unplaced items and any beam node not yet offered
+        // a batch it must skip looks perfect beside it. That is the arrangement in which a
+        // truncated node wins the comparison -- in a scene where everything fits the
+        // incumbent is unplaced-free too, the truncated node never wins, and the hole stays
+        // hidden behind an assertion that passes for the wrong reason.
+        let mut narrow = item("beamed");
+        narrow.dimensions = dimensions(600, 600, 600);
+        let instances = (1..=12)
+            .map(|sequence| ItemInstance {
+                item: narrow.clone(),
+                sequence,
+            })
+            .collect::<Vec<_>>();
+        let mut request = request(&narrow, &container(), None);
+        request.config.container_plan_beam_width = 4;
+        request.config.container_plan_node_limit = 3;
+
+        let mut metrics = SolverMetrics::default();
+        let (state, unplaced) = try_pack_into_beam(
+            &container(),
+            1,
+            &instances,
+            &request,
+            &[],
+            &[],
+            &Deadline::new(request.config.time_limit_ms),
+            &mut metrics,
+        );
+
+        assert_eq!(
+            state.packed.placements.len() + unplaced.len(),
+            instances.len(),
+            "the beam stopped early and lost {} instance(s)",
+            instances.len() - state.packed.placements.len() - unplaced.len(),
+        );
+        let mut seen = state
+            .packed
+            .placements
+            .iter()
+            .map(|placement| placement.instance.id())
+            .collect::<BTreeSet<_>>();
+        seen.extend(unplaced.iter().map(ItemInstance::id));
+        assert_eq!(
+            seen,
+            instances
+                .iter()
+                .map(ItemInstance::id)
+                .collect::<BTreeSet<_>>(),
+            "an instance was reported twice or invented",
+        );
+    }
+
+    fn candidates_with_limit(limit: usize) -> (Vec<Candidate>, SolverMetrics) {
+        let item = item("varied");
+        let container = container();
+        let request = request(&item, &container, None);
+        let state = ContainerState::new(container, 1);
+        let instance = ItemInstance { item, sequence: 1 };
+        let mut metrics = SolverMetrics::default();
+        let candidates = find_candidates_at_points(
+            &state,
+            &instance,
+            &request,
+            &[],
+            &[],
+            vec![Point::ZERO, Point { x: 200, y: 0, z: 0 }],
+            limit,
+            &Deadline::new(60_000),
+            &mut metrics,
+        );
+        (candidates, metrics)
+    }
+
+    #[test]
+    fn bounded_selection_does_not_shorten_candidate_effort_metrics() {
+        let (one, one_metrics) = candidates_with_limit(1);
+        let (three, three_metrics) = candidates_with_limit(3);
+
+        assert_eq!(one.len(), 1);
+        assert_eq!(three.len(), 3);
+        assert_eq!(one_metrics.candidate_points_considered, 2);
+        assert_eq!(one_metrics.orientations_considered, 12);
+        assert_eq!(one_metrics.feasible_candidates, 12);
+        assert_eq!(one_metrics.support_checks, 12);
+        assert_eq!(
+            one_metrics.to_json(),
+            three_metrics.to_json(),
+            "retained width must not change the counted search prefix"
+        );
+    }
+
+    #[test]
+    fn invariant_incompatibility_keeps_the_existing_effort_prefix() {
+        let container = container();
+        let mut state = ContainerState::new(container.clone(), 1);
+        let mut base = item("base");
+        base.tags.insert("hazard".into());
+        let base_candidate = candidate(0, Point::ZERO, Rotation::Lwh, 1.0);
+        apply_candidate(
+            &mut state,
+            ItemInstance {
+                item: base,
+                sequence: 1,
+            },
+            &base_candidate,
+        );
+
+        let mut incoming = item("incoming");
+        incoming.incompatible_tags.insert("hazard".into());
+        let effort_budget = EffortBudget {
+            max_placement_attempts: Some(5),
+            ..Default::default()
+        };
+        let request = request(&incoming, &container, Some(effort_budget));
+        let mut metrics = SolverMetrics::default();
+        let candidates = find_candidates_at_points(
+            &state,
+            &ItemInstance {
+                item: incoming,
+                sequence: 1,
+            },
+            &request,
+            &[],
+            &[],
+            vec![Point { x: 200, y: 0, z: 0 }, Point { x: 400, y: 0, z: 0 }],
+            1,
+            &Deadline::new(60_000),
+            &mut metrics,
+        );
+
+        assert!(candidates.is_empty());
+        assert_eq!(metrics.candidate_points_considered, 1);
+        assert_eq!(metrics.orientations_considered, 5);
+        assert_eq!(metrics.feasible_candidates, 0);
+        assert_eq!(metrics.support_checks, 0);
+    }
+
+    #[test]
+    fn candidate_load_check_counts_nested_support_edges() {
+        let mut nested = item("nested");
+        nested.dimensions = dimensions(10, 10, 10);
+        nested.allowed_rotations = vec![Rotation::Lwh];
+        nested.weight = Weight(Weight::TICKS_PER_KG);
+        nested.max_top_load = Some(Weight(Weight::TICKS_PER_KG * 3 / 2));
+        nested.nesting_height = Some(Length(5));
+        let mut state = ContainerState::new(container(), 1);
+        let candidate_at = |z| Candidate {
+            envelope_origin: Point { x: 0, y: 0, z },
+            position: Point { x: 0, y: 0, z },
+            rotation: Rotation::Lwh,
+            dimensions: dimensions(10, 10, 10),
+            envelope_dimensions: dimensions(10, 10, 10),
+            support_ratio: 1.0,
+            score: 0,
+        };
+
+        apply_candidate(
+            &mut state,
+            ItemInstance {
+                item: nested.clone(),
+                sequence: 1,
+            },
+            &candidate_at(0),
+        );
+        let second = ItemInstance {
+            item: nested.clone(),
+            sequence: 2,
+        };
+        assert!(candidate_respects_loads(
+            &state,
+            &second,
+            &candidate_at(5),
+            None,
+            None
+        ));
+        apply_candidate(&mut state, second, &candidate_at(5));
+
+        let third = ItemInstance {
+            item: nested,
+            sequence: 3,
+        };
+        assert!(!candidate_respects_loads(
+            &state,
+            &third,
+            &candidate_at(10),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn nested_top_loads_follow_only_the_adjacent_column_edges() {
+        let mut nested = item("nested-loads");
+        nested.dimensions = dimensions(10, 10, 10);
+        nested.allowed_rotations = vec![Rotation::Lwh];
+        nested.weight = Weight(100);
+        nested.nesting_height = Some(Length(5));
+        let candidate_at = |z| Candidate {
+            envelope_origin: Point { x: 0, y: 0, z },
+            position: Point { x: 0, y: 0, z },
+            rotation: Rotation::Lwh,
+            dimensions: dimensions(10, 10, 10),
+            envelope_dimensions: dimensions(10, 10, 10),
+            support_ratio: 1.0,
+            score: 0,
+        };
+        let mut state = ContainerState::new(container(), 1);
+        for (sequence, z) in [0, 5, 10].into_iter().enumerate() {
+            apply_candidate(
+                &mut state,
+                ItemInstance {
+                    item: nested.clone(),
+                    sequence: sequence + 1,
+                },
+                &candidate_at(z),
+            );
+        }
+
+        assert_eq!(
+            calculate_top_loads(&state.packed.placements),
+            Some(vec![200, 100, 0])
+        );
+        state.packed.placements[1].instance.item.max_top_load = Some(Weight(75));
+        assert_eq!(calculate_top_loads(&state.packed.placements), None);
+    }
+
+    #[test]
+    fn nested_candidate_uses_its_direct_predecessor_for_support_and_ground_rules() {
+        for rule in ["single", "covered"] {
+            let mut nested = item("nested-support");
+            nested.dimensions = dimensions(10, 10, 10);
+            nested.allowed_rotations = vec![Rotation::Lwh];
+            nested.nesting_height = Some(Length(5));
+            nested.minimum_support_ratio = 1.0;
+            nested.ground_contact_rule = Some(rule.into());
+            let container = container();
+            let request = request(&nested, &container, None);
+            let base_candidate = Candidate {
+                envelope_origin: Point::ZERO,
+                position: Point::ZERO,
+                rotation: Rotation::Lwh,
+                dimensions: dimensions(10, 10, 10),
+                envelope_dimensions: dimensions(10, 10, 10),
+                support_ratio: 1.0,
+                score: 0,
+            };
+            let mut state = ContainerState::new(container, 1);
+            apply_candidate(
+                &mut state,
+                ItemInstance {
+                    item: nested.clone(),
+                    sequence: 1,
+                },
+                &base_candidate,
+            );
+            let mut metrics = SolverMetrics::default();
+            let candidates = find_candidates_at_points(
+                &state,
+                &ItemInstance {
+                    item: nested,
+                    sequence: 2,
+                },
+                &request,
+                &[],
+                &[],
+                vec![Point { x: 0, y: 0, z: 5 }],
+                1,
+                &Deadline::new(60_000),
+                &mut metrics,
+            );
+
+            assert_eq!(candidates.len(), 1, "rule={rule}");
+            assert_eq!(candidates[0].support_ratio, 1.0, "rule={rule}");
+            apply_candidate(
+                &mut state,
+                ItemInstance {
+                    item: request.items[0].clone(),
+                    sequence: 2,
+                },
+                &candidates[0],
+            );
+            assert_eq!(state.packed.placements[1].support_ratio, 1.0);
+            assert_eq!(metrics.support_checks, 1);
+            assert_eq!(metrics.feasible_candidates, 1);
+        }
+
+        let mut nested = item("nested-support");
+        nested.dimensions = dimensions(10, 10, 10);
+        nested.allowed_rotations = vec![Rotation::Lwh];
+        nested.nesting_height = Some(Length(5));
+        nested.minimum_support_ratio = 1.0;
+        nested.ground_contact_rule = Some("multiple".into());
+        let container = container();
+        let request = request(&nested, &container, None);
+        let mut state = ContainerState::new(container, 1);
+        apply_candidate(
+            &mut state,
+            ItemInstance {
+                item: nested.clone(),
+                sequence: 1,
+            },
+            &Candidate {
+                envelope_origin: Point::ZERO,
+                position: Point::ZERO,
+                rotation: Rotation::Lwh,
+                dimensions: dimensions(10, 10, 10),
+                envelope_dimensions: dimensions(10, 10, 10),
+                support_ratio: 1.0,
+                score: 0,
+            },
+        );
+        let mut metrics = SolverMetrics::default();
+        let candidates = find_candidates_at_points(
+            &state,
+            &ItemInstance {
+                item: nested,
+                sequence: 2,
+            },
+            &request,
+            &[],
+            &[],
+            vec![Point { x: 0, y: 0, z: 5 }],
+            1,
+            &Deadline::new(60_000),
+            &mut metrics,
+        );
+
+        assert!(candidates.is_empty());
+        assert_eq!(metrics.support_checks, 1);
+        assert_eq!(metrics.feasible_candidates, 0);
+    }
+
+    // ------------------------------------------- stop accessibility
+    //
+    // The worked examples in docs/STOP-ACCESSIBILITY.md live in
+    // `conformance/scene/stop-accessibility-fixtures.json` and are read from there, so this
+    // suite and the other three assert one table rather than four transcriptions of it.
+
+    /// Ticks, read straight rather than scaled: all four engines assert the same integers
+    /// instead of each applying its own conversion.
+    fn fixture_dimensions(raw: &serde_json::Value) -> Dimensions {
+        dimensions(
+            raw["length"].as_i64().unwrap(),
+            raw["width"].as_i64().unwrap(),
+            raw["height"].as_i64().unwrap(),
+        )
+    }
+
+    fn fixture_origin(raw: &serde_json::Value) -> Point {
+        Point {
+            x: raw["x"].as_i64().unwrap(),
+            y: raw["y"].as_i64().unwrap(),
+            z: raw["z"].as_i64().unwrap(),
+        }
+    }
+
+    /// An absent stop is `null` in the corpus and `None` here, which both engines then read
+    /// as the latest possible stop.
+    fn fixture_stop(raw: &serde_json::Value) -> Option<usize> {
+        raw["stop_index"].as_u64().map(|stop| stop as usize)
+    }
+
+    fn fixture_placement(raw: &serde_json::Value) -> Placement {
+        let mut placed = item(raw["id"].as_str().unwrap());
+        placed.dimensions = fixture_dimensions(&raw["dimensions"]);
+        placed.stop_index = fixture_stop(raw);
+        let origin = fixture_origin(&raw["origin"]);
+        let dims = placed.dimensions;
+        Placement {
+            instance: ItemInstance {
+                item: placed,
+                sequence: 1,
+            },
+            position: origin,
+            rotation: Rotation::Lwh,
+            dimensions: dims,
+            envelope_origin: origin,
+            envelope_dimensions: dims,
+            support_ratio: 1.0,
+            top_load: Weight(0),
+            fixed: false,
+        }
+    }
+
+    /// Every scene in the shared corpus, with the verdict every engine must reach.
+    ///
+    /// `accessible` is asserted by all four engines and `route_order_allowed` here, in
+    /// Python and in PHP. `code` is not: this engine answers with a verdict rather than a
+    /// reason, and the corpus records which columns each engine can check.
+    #[test]
+    fn shared_four_language_stop_accessibility_scenes() {
+        // A cross-language corpus kept one level above this crate; a published copy does
+        // not carry it.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../../conformance/scene/stop-accessibility-fixtures.json");
+        let Ok(payload_text) = std::fs::read_to_string(&path) else {
+            eprintln!(
+                "skipping: the shared cross-language scene corpus is not part of this package"
+            );
+            return;
+        };
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+        let scenes = payload["scenes"].as_array().unwrap();
+        assert!(
+            !scenes.is_empty(),
+            "an empty corpus would pass this loop without asserting anything",
+        );
+
+        for scene in scenes {
+            let id = scene["id"].as_str().unwrap();
+            let placements: Vec<Placement> = scene["placements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(fixture_placement)
+                .collect();
+            let raw = &scene["candidate"];
+            let candidate = Aabb {
+                origin: fixture_origin(&raw["origin"]),
+                dimensions: fixture_dimensions(&raw["dimensions"]),
+            };
+            let doors: Vec<String> = scene["directions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|door| door.as_str().unwrap().to_owned())
+                .collect();
+            let container = fixture_dimensions(&scene["container"]);
+            let base =
+                StopAccessibilityBase::new(fixture_stop(raw), &placements, container, &doors);
+
+            assert_eq!(
+                base.allows(candidate, &placements, container, &doors),
+                scene["accessible"].as_bool().unwrap(),
+                "{id}",
+            );
+            assert_eq!(
+                stop_accessible(fixture_stop(raw), candidate, &placements, container, &doors),
+                scene["accessible"].as_bool().unwrap(),
+                "from-scratch and candidate-sweep paths diverged for {id}",
+            );
+            if let Some(expected) = scene["route_order_allowed"].as_bool() {
+                assert_eq!(
+                    route_contact_allowed(fixture_stop(raw), candidate, &placements),
+                    expected,
+                    "{id}",
+                );
+            }
+        }
+    }
+
+    /// A small deterministic generator: the property below wants many scenes, not a
+    /// chosen few, and a fixed seed keeps every run identical.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    /// Stacking facts for the differential scenes: no class, a class with no list, a list
+    /// that accepts its own class, and one that refuses it.
+    type StackingFacts = (Option<&'static str>, BTreeSet<String>);
+
+    fn stacking_pool() -> Vec<StackingFacts> {
+        let only_a = BTreeSet::from(["A".to_owned()]);
+        vec![
+            (None, BTreeSet::new()),
+            (Some("A"), BTreeSet::new()),
+            (Some("A"), only_a.clone()),
+            (Some("B"), only_a),
+        ]
+    }
+
+    fn load_body<'a>(lcg: &mut Lcg, origin: Point, pool: &'a [StackingFacts]) -> LoadBody<'a> {
+        let side = 10 + lcg.next(3) as i64 * 10;
+        let (stacking_group, accepts_stacking_groups) = &pool[lcg.next(pool.len() as u64) as usize];
+        LoadBody {
+            envelope: Aabb {
+                origin,
+                dimensions: dimensions(side, side, 10 + lcg.next(2) as i64 * 10),
+            },
+            weight: lcg.next(5) as i64 * 1_000,
+            stackable: lcg.next(6) != 0,
+            max_top_load: (lcg.next(3) == 0).then(|| lcg.next(4) as i64 * 1_500),
+            max_stacked_items: (lcg.next(4) == 0).then(|| lcg.next(3) as usize),
+            max_compression_pressure_kpa: (lcg.next(4) == 0).then(|| 1 + lcg.next(3) as i64),
+            stacking_group: *stacking_group,
+            accepts_stacking_groups,
+        }
+    }
+
+    fn body_item(body: &LoadBody, sequence: usize) -> ItemInstance {
+        let mut item = item("body");
+        item.dimensions = body.envelope.dimensions;
+        item.weight = Weight(body.weight);
+        item.stackable = body.stackable;
+        item.max_top_load = body.max_top_load.map(Weight);
+        item.max_stacked_items = body.max_stacked_items;
+        item.max_compression_pressure_kpa = body.max_compression_pressure_kpa;
+        item.stacking_group = body.stacking_group.map(str::to_owned);
+        item.accepts_stacking_groups = body.accepts_stacking_groups.clone();
+        ItemInstance { item, sequence }
+    }
+
+    /// The from-scratch verdict `candidate_respects_loads` gave before the sweep existed:
+    /// every placement plus the candidate, one graph, every rule over all of it.
+    fn rebuilt_verdict(
+        bodies: &[LoadBody],
+        candidate: LoadBody,
+        max_density: Option<Weight>,
+    ) -> bool {
+        let mut all = bodies.to_vec();
+        all.push(candidate);
+        let boxes = all.iter().map(|body| body.envelope).collect::<Vec<_>>();
+        let widest = boxes
+            .iter()
+            .map(|box_| box_.dimensions.length.0.max(box_.dimensions.width.0))
+            .max()
+            .unwrap_or(1);
+        load_rules_hold(
+            &all,
+            &ContactGraph::with_cell_hint(&boxes, widest),
+            max_density,
+        )
+    }
+
+    #[test]
+    fn the_incremental_load_sweep_matches_the_from_scratch_verdict() {
+        // Stacks are built on a coarse lattice so faces meet, overhang and float; candidates
+        // land under existing boxes as often as on top of them, which is the case where a
+        // supporter list changes and the settled shares move.
+        let mut lcg = Lcg(20_260_902);
+        let pool = stacking_pool();
+        let mut agreements = (0_usize, 0_usize);
+        for scene in 0..400 {
+            let mut container = container();
+            container.max_stack_density =
+                (scene % 3 == 0).then(|| Weight(lcg.next(4) as i64 * 5_000_000_000));
+            let mut state = ContainerState::new(container.clone(), 1);
+            let mut bodies = Vec::new();
+            for sequence in 0..(1 + lcg.next(7) as usize) {
+                let origin = Point {
+                    x: lcg.next(4) as i64 * 10,
+                    y: lcg.next(4) as i64 * 10,
+                    z: lcg.next(4) as i64 * 10,
+                };
+                let body = load_body(&mut lcg, origin, &pool);
+                if bodies
+                    .iter()
+                    .any(|placed: &LoadBody| placed.envelope.intersects(body.envelope))
+                {
+                    continue;
+                }
+                let candidate = Candidate {
+                    envelope_origin: origin,
+                    position: origin,
+                    rotation: Rotation::Lwh,
+                    dimensions: body.envelope.dimensions,
+                    envelope_dimensions: body.envelope.dimensions,
+                    support_ratio: 1.0,
+                    score: 0,
+                };
+                apply_candidate(&mut state, body_item(&body, sequence), &candidate);
+                bodies.push(body);
+            }
+            let sweep = LoadSweep::new(&state, 30);
+            for _ in 0..12 {
+                let origin = Point {
+                    x: lcg.next(5) as i64 * 10,
+                    y: lcg.next(5) as i64 * 10,
+                    z: lcg.next(5) as i64 * 10,
+                };
+                let candidate = load_body(&mut lcg, origin, &pool);
+                if bodies
+                    .iter()
+                    .any(|placed| placed.envelope.intersects(candidate.envelope))
+                {
+                    continue;
+                }
+                let expected = rebuilt_verdict(&bodies, candidate, container.max_stack_density);
+                assert_eq!(
+                    sweep.allows(candidate),
+                    expected,
+                    "scene {scene}: candidate {candidate:?} over {bodies:?}"
+                );
+                if expected {
+                    agreements.0 += 1;
+                } else {
+                    agreements.1 += 1;
+                }
+            }
+        }
+        // The property is only worth something if both verdicts actually occur.
+        assert!(agreements.0 > 100 && agreements.1 > 100, "{agreements:?}");
+    }
+
+    fn signed_placement(id: &str, sequence: usize, x: i64, y: i64, z: i64) -> Placement {
+        let mut placed = fixture_placement(&serde_json::json!({
+            "id": id,
+            "dimensions": {"length": 1, "width": 1, "height": 1},
+            "origin": {"x": x, "y": y, "z": z}
+        }));
+        placed.instance.sequence = sequence;
+        placed
+    }
+
+    fn rendered_signature(placements: &[Placement]) -> String {
+        placements
+            .iter()
+            .map(|placement| {
+                format!(
+                    "{}@{},{},{}",
+                    placement.instance.id(),
+                    placement.envelope_origin.x,
+                    placement.envelope_origin.y,
+                    placement.envelope_origin.z
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// The streamed comparison must agree with 1.3.0's string key on every pair, including
+    /// the cases that break a per-placement comparison: one entry a prefix of another
+    /// (`@1,2,3` against `@1,2,30`), a shorter list against a longer one, ids that contain
+    /// `#` or bytes above `|`, and negative coordinates.
+    #[test]
+    fn placement_signatures_order_exactly_as_their_strings() {
+        let entries = [
+            signed_placement("a", 1, 1, 2, 3),
+            signed_placement("a", 1, 1, 2, 30),
+            signed_placement("a", 10, 1, 2, 3),
+            signed_placement("a#1", 1, 0, 0, 0),
+            signed_placement("a~", 2, 0, 0, 0),
+            signed_placement("b", 1, -5, 0, 0),
+            signed_placement("é", 1, 0, 0, 0),
+        ];
+        let mut lists: Vec<Vec<Placement>> = vec![Vec::new()];
+        for first in &entries {
+            lists.push(vec![first.clone()]);
+            for second in &entries {
+                lists.push(vec![first.clone(), second.clone()]);
+                lists.push(vec![entries[0].clone(), first.clone(), second.clone()]);
+            }
+        }
+        for left in &lists {
+            for right in &lists {
+                assert_eq!(
+                    compare_placement_signatures(left, right),
+                    rendered_signature(left).cmp(&rendered_signature(right)),
+                    "{} vs {}",
+                    rendered_signature(left),
+                    rendered_signature(right)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod made_to_measure_chain_tests {
+    use super::*;
+    use crate::api::request_from_json;
+    use serde_json::json;
+
+    const MM: i64 = 16_000;
+
+    fn request(effort: u64) -> PackingRequest {
+        request_from_json(&json!({
+            "configuration": {"solver_profile": "fast", "time_limit_ms": 60000,
+                              "effort_budget": {"max_search_nodes": effort}},
+            "items": [{"id": "cube", "quantity": 3,
+                       "dimensions": {"length": "100", "width": "100", "height": "100"}}],
+            "containers": [{"id": "machine", "cost_minor": 40,
+                "inner_dimensions": {"length": "1510", "width": "1510", "height": "1510"},
+                "made_to_measure": {"minimum": {"length": "60", "width": "60", "height": "60"},
+                                    "increment": {"length": "25", "width": "25", "height": "25"},
+                                    "cost_per_square_metre_minor": 1000}}]
+        }))
+        .expect("the scene is a valid request")
+    }
+
+    /// Places a scripted number of items per rung, along x at the scripted pitch.
+    fn chain(
+        request: &PackingRequest,
+        script: &[(usize, i64)],
+    ) -> (ContainerState, Vec<ItemInstance>, usize, Vec<Dimensions>) {
+        let mut envelopes = Vec::new();
+        let mut metrics = SolverMetrics::default();
+        let items = request.instances();
+        let (state, next, trials) = trial_container(
+            &request.containers[0],
+            1,
+            &items,
+            request,
+            &Deadline::new(60_000),
+            &mut metrics,
+            |container, sequence, items, metrics| {
+                let (count, pitch) = script[envelopes.len()];
+                envelopes.push(container.inner_dimensions);
+                metrics.search_nodes_expanded += 1;
+                let mut state = ContainerState::new(container, sequence);
+                for (index, instance) in items.iter().take(count).enumerate() {
+                    let origin = Point {
+                        x: index as i64 * pitch * MM,
+                        y: 0,
+                        z: 0,
+                    };
+                    let size = instance.item.dimensions;
+                    commit_placement(
+                        &mut state,
+                        Placement {
+                            instance: instance.clone(),
+                            position: origin,
+                            rotation: Rotation::Lwh,
+                            dimensions: size,
+                            envelope_origin: origin,
+                            envelope_dimensions: size,
+                            support_ratio: 1.0,
+                            top_load: Weight(0),
+                            fixed: false,
+                        },
+                    );
+                }
+                (state, items[count..].to_vec())
+            },
+        );
+        (state, next, trials, envelopes)
+    }
+
+    #[test]
+    fn the_first_complete_rung_is_kept_without_trying_a_larger_one() {
+        let (state, next, trials, envelopes) = chain(&request(1_000), &[(3, 100); 4]);
+        assert_eq!((trials, envelopes.len(), next.len()), (1, 1, 0));
+        let inner = state.packed.container.inner_dimensions;
+        assert_eq!(
+            [inner.length.0, inner.width.0, inner.height.0],
+            [310 * MM, 110 * MM, 110 * MM]
+        );
+    }
+
+    #[test]
+    fn an_incomplete_chain_keeps_the_round_key_choice_and_the_smaller_rung_on_a_tie() {
+        let (state, _, trials, _) =
+            chain(&request(1_000), &[(1, 100), (2, 100), (1, 100), (2, 105)]);
+        assert_eq!(trials, 4);
+        let xs = state
+            .packed
+            .placements
+            .iter()
+            .map(|placement| placement.position.x)
+            .collect::<Vec<_>>();
+        assert_eq!(xs, vec![0, 100 * MM]);
+    }
+
+    #[test]
+    fn a_chain_that_places_nothing_stays_a_zero_placement_trial() {
+        let (state, next, trials, _) = chain(&request(1_000), &[(0, 100); 4]);
+        assert_eq!((trials, next.len()), (4, 3));
+        assert!(state.packed.placements.is_empty());
+    }
+
+    #[test]
+    fn a_counted_limit_reached_mid_chain_stops_it_with_the_best_so_far() {
+        let (state, next, trials, _) = chain(&request(1), &[(1, 100); 4]);
+        assert_eq!(
+            (trials, next.len(), state.packed.placements.len()),
+            (1, 2, 1)
+        );
+    }
+
+    #[test]
+    fn candidate_accumulator_bounded_peek_mut_replaces_worst_and_preserves_fifo() {
+        let make_cand = |score: i128, z: i64| Candidate {
+            envelope_origin: Point { x: 0, y: 0, z },
+            position: Point { x: 0, y: 0, z },
+            rotation: Rotation::Lwh,
+            dimensions: Dimensions {
+                length: Length(10),
+                width: Length(10),
+                height: Length(10),
+            },
+            envelope_dimensions: Dimensions {
+                length: Length(10),
+                width: Length(10),
+                height: Length(10),
+            },
+            support_ratio: 1.0,
+            score,
+        };
+
+        let mut acc = CandidateAccumulator::new(3);
+        acc.push(make_cand(50, 0));
+        acc.push(make_cand(10, 0));
+        acc.push(make_cand(30, 0));
+        // Capacity is 3, currently has scores 10, 30, 50
+        // Push worse candidate (score 60) -> should be ignored
+        acc.push(make_cand(60, 0));
+        // Push better candidate (score 20) -> should replace 50, now 10, 20, 30
+        acc.push(make_cand(20, 0));
+        // Push candidate with score 25 -> replaces 30, now 10, 20, 25
+        acc.push(make_cand(25, 0));
+
+        let finished = acc.finish();
+        assert_eq!(finished.len(), 3);
+        assert_eq!(finished[0].score, 10);
+        assert_eq!(finished[1].score, 20);
+        assert_eq!(finished[2].score, 25);
+    }
+}

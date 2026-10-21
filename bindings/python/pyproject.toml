@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.9.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "packvium-native-rust"
+version = "1.8.0"
+requires-python = ">=3.9"
+description = "Compiled Rust backend for Packvium, consumed by the packvium-native selector"
+readme = "README.md"
+license = "MIT"
+keywords = ["3d-bin-packing", "bin-packing", "3d-packing", "cartonization", "container-loading", "pallet-packing", "truck-loading", "packing-algorithm", "logistics", "deterministic"]
+authors = [{name = "Packvium contributors"}]
+
+[project.urls]
+Homepage = "https://packvium.com"
+Documentation = "https://packvium.com/docs"
+Source = "https://github.com/toxakara/packvium-native"
+Issues = "https://github.com/toxakara/packvium-native/issues"
+
+[tool.maturin]
+module-name = "packvium_native_rust._packvium_native_rust"
+python-source = "python"

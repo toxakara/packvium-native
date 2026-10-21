@@ -1,0 +1,162 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege by default; jobs that need more request it explicitly.
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  # Every wheel is installed into a clean interpreter and run from there, on the abi3 floor
+  # and on the newest CPython, on the runner of the platform it was built for.
+  wheel:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+        python: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install "maturin>=1.9.4,<2"
+      - run: maturin build --release --locked --out dist
+        working-directory: bindings/python
+      - run: python -m pip install --no-index --find-links bindings/python/dist packvium-native-rust
+      - run: python -m unittest discover -s tests/python -v
+
+  node-addon:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, platform: linux-x64-gnu, runner: ubuntu-latest}
+          - {target: aarch64-apple-darwin, platform: darwin-arm64, runner: macos-latest}
+          - {target: x86_64-apple-darwin, platform: darwin-x64, runner: macos-15-intel}
+          - {target: x86_64-pc-windows-msvc, platform: win32-x64-msvc, runner: windows-latest}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: {node-version: "22"}
+      - run: cargo build --release --locked -p packvium-node-native --target ${{ matrix.target }}
+      - run: node scripts/stage-node-addon.mjs ${{ matrix.target }}
+      - run: node tests/node/addon.test.mjs
+      - name: The root and platform tarballs carry exactly the loader and the binary
+        shell: bash
+        run: |
+          (cd bindings/node && npm pack --dry-run)
+          (cd bindings/node/npm/${{ matrix.platform }} && npm pack --dry-run)
+      - if: matrix.platform == 'linux-x64-gnu'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: addon-linux-x64-gnu
+          path: bindings/node/packvium-native.linux-x64-gnu.node
+
+  # N-API is ABI-stable, so one binary must load on every Node release the engine supports.
+  node-versions:
+    needs: node-addon
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["16", "18", "20", "22", "24", "26"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with: {name: addon-linux-x64-gnu, path: bindings/node}
+      - run: node tests/node/addon.test.mjs
+
+  ffi-library:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, library: libpackvium_ffi.so, runner: ubuntu-latest}
+          - {target: aarch64-unknown-linux-gnu, library: libpackvium_ffi.so, runner: ubuntu-24.04-arm}
+          - {target: aarch64-apple-darwin, library: libpackvium_ffi.dylib, runner: macos-latest}
+          - {target: x86_64-apple-darwin, library: libpackvium_ffi.dylib, runner: macos-15-intel}
+          - {target: x86_64-pc-windows-msvc, library: packvium_ffi.dll, runner: windows-latest}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: {python-version: "3.13"}
+      - run: cargo build --release --locked -p packvium-ffi --target ${{ matrix.target }}
+      - run: python tests/ffi/ffi_smoke.py target/${{ matrix.target }}/release/${{ matrix.library }}
+      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ffi-linux-x64
+          path: target/${{ matrix.target }}/release/${{ matrix.library }}
+
+  # The published PHP bridge against the library built here, with FFI enabled, on every PHP
+  # release the bridge's native path supports. The bridge must pick the library and agree with
+  # the pure-PHP engine it falls back to.
+  php-bridge:
+    needs: ffi-library
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.2", "8.3", "8.4", "8.5"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with: {name: ffi-linux-x64, path: lib}
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: composer:v2
+          extensions: ffi
+      - name: Install the published bridge and engine into a scratch project
+        run: |
+          mkdir -p "$RUNNER_TEMP/bridge"
+          cd "$RUNNER_TEMP/bridge"
+          composer init --no-interaction --name=example/bridge-smoke
+          composer require --no-interaction --no-progress packvium/native-bridge packvium/packvium
+      - run: php -d ffi.enable=1 tests/php/bridge_smoke.php "$RUNNER_TEMP/bridge/vendor/autoload.php" lib/libpackvium_ffi.so
+
+  # Fails a pull request that introduces a dependency with a known vulnerability or a
+  # licence the project has not accepted. It reads GitHub's dependency graph, so it needs
+  # nothing committed here beyond this job.
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+          comment-summary-in-pr: on-failure

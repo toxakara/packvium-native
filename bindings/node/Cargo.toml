@@ -1,0 +1,17 @@
+[package]
+name = "packvium-node-native"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.88"
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packvium-core.workspace = true
+napi = { version = "3.11.0", default-features = false, features = ["napi8"] }
+napi-derive = "3.5.10"
+
+[build-dependencies]
+napi-build = "2"

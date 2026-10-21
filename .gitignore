@@ -1,0 +1,20 @@
+# Build output
+target/
+dist/
+packages/
+*.so
+*.dylib
+*.dll
+*.pyd
+*.node
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Node
+node_modules/
+
+# macOS
+.DS_Store

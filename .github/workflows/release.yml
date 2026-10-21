@@ -1,0 +1,338 @@
+name: release
+
+# Publishing is driven by a tag, and only by a tag. There is no registry token anywhere in
+# this repository: PyPI and npm Trusted Publishing exchange this workflow's OIDC identity for
+# a short-lived credential, and every artifact is attested before it leaves the build.
+#
+# Before the first run, once:
+#   PyPI: a (pending) Trusted Publisher for `packvium-native-rust` -- owner and repository of
+#     this repository, workflow `release.yml`, environment `pypi`.
+#   npm: a Trusted Publisher on each of `@packvium/native`, `@packvium/native-darwin-arm64`,
+#     `@packvium/native-darwin-x64`, `@packvium/native-linux-x64-gnu` and
+#     `@packvium/native-win32-x64-msvc` -- workflow `release.yml`, environment `npm`, with
+#     `npm publish` allowed.
+#   GitHub: environments named `pypi` and `npm`, with whatever reviewers the project wants.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The tag and every packaged version must agree. Without this, `git tag v0.2.0` on a
+      # tree that still says 0.1.0 publishes 0.1.0 under a name that claims otherwise, and the
+      # mistake is only visible after it is public and immutable.
+      - name: The tag must match every version this repository publishes
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" <<'PY'
+          import json, sys, tomllib
+          from pathlib import Path
+          tagged = sys.argv[1]
+          versions = {
+              "Cargo.toml": tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]["version"],
+              "bindings/python/pyproject.toml": tomllib.loads(Path("bindings/python/pyproject.toml").read_text())["project"]["version"],
+          }
+          for manifest in ["bindings/node/package.json", *map(str, sorted(Path("bindings/node/npm").glob("*/package.json")))]:
+              versions[manifest] = json.loads(Path(manifest).read_text())["version"]
+          wrong = {path: found for path, found in versions.items() if found != tagged}
+          for path, found in wrong.items():
+              print(f"{path} declares {found}, the tag says {tagged}", file=sys.stderr)
+          raise SystemExit(1 if wrong else 0)
+          PY
+      - name: The tag must have a changelog entry
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## \[${tagged}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## [${tagged}]' section for tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+  # Inside the PyPA image, so the wheel is installable on every manylinux_2_28 system rather
+  # than tagged for one build host.
+  wheel-linux:
+    needs: verify-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install the pinned Rust toolchain
+        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.97.1
+      - name: Build an abi3-py39 manylinux_2_28 wheel
+        working-directory: bindings/python
+        run: |
+          . "$HOME/.cargo/env"
+          /opt/python/cp312-cp312/bin/pip install --quiet "maturin>=1.9.4,<2"
+          /opt/python/cp312-cp312/bin/maturin build --release --locked --compatibility manylinux_2_28 --out dist
+      - name: Install and run the wheel on the Python 3.9 floor and on 3.14
+        run: |
+          for python in /opt/python/cp39-cp39/bin/python /opt/python/cp314-cp314/bin/python; do
+            "$python" -m pip install --quiet --no-index --find-links bindings/python/dist packvium-native-rust
+            "$python" -m unittest discover -s tests/python -v
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: bindings/python/dist/*.whl
+
+  wheel:
+    needs: verify-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.9"
+      - run: python -m pip install "maturin>=1.9.4,<2"
+      - run: maturin build --release --locked --out dist
+        working-directory: bindings/python
+      - run: python -m pip install --no-index --find-links bindings/python/dist packvium-native-rust
+      - run: python -m unittest discover -s tests/python -v
+      # Test the exact floor-built wheel on the newest interpreter before publishing it.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install --no-index --find-links bindings/python/dist packvium-native-rust
+      - run: python -m unittest discover -s tests/python -v
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: bindings/python/dist/*.whl
+
+  node-addon:
+    needs: verify-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, platform: linux-x64-gnu, runner: ubuntu-latest}
+          - {target: aarch64-apple-darwin, platform: darwin-arm64, runner: macos-15}
+          - {target: x86_64-apple-darwin, platform: darwin-x64, runner: macos-15-intel}
+          - {target: x86_64-pc-windows-msvc, platform: win32-x64-msvc, runner: windows-latest}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: {node-version: "22"}
+      - run: cargo build --release --locked -p packvium-node-native --target ${{ matrix.target }}
+      - run: node scripts/stage-node-addon.mjs ${{ matrix.target }}
+      - run: node tests/node/addon.test.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: addon-${{ matrix.platform }}
+          path: bindings/node/npm/${{ matrix.platform }}/packvium-native.${{ matrix.platform }}.node
+
+  ffi-library:
+    needs: verify-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, library: libpackvium_ffi.so, asset: libpackvium_ffi-x86_64-unknown-linux-gnu.so, runner: ubuntu-latest}
+          - {target: aarch64-unknown-linux-gnu, library: libpackvium_ffi.so, asset: libpackvium_ffi-aarch64-unknown-linux-gnu.so, runner: ubuntu-24.04-arm}
+          - {target: aarch64-apple-darwin, library: libpackvium_ffi.dylib, asset: libpackvium_ffi-aarch64-apple-darwin.dylib, runner: macos-15}
+          - {target: x86_64-apple-darwin, library: libpackvium_ffi.dylib, asset: libpackvium_ffi-x86_64-apple-darwin.dylib, runner: macos-15-intel}
+          - {target: x86_64-pc-windows-msvc, library: packvium_ffi.dll, asset: packvium_ffi-x86_64-pc-windows-msvc.dll, runner: windows-latest}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: {python-version: "3.13"}
+      - run: cargo build --release --locked -p packvium-ffi --target ${{ matrix.target }}
+      - run: python tests/ffi/ffi_smoke.py target/${{ matrix.target }}/release/${{ matrix.library }}
+      - name: Name the library for the platform it was built and run on
+        shell: bash
+        run: |
+          mkdir -p assets
+          cp "target/${{ matrix.target }}/release/${{ matrix.library }}" "assets/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ffi-${{ matrix.target }}
+          path: assets/${{ matrix.asset }}
+
+  # Collects every artifact, packs the npm tarballs that will be published, and attests all of
+  # it. The publish jobs below upload exactly these files and nothing rebuilt.
+  build:
+    needs: [wheel-linux, wheel, node-addon, ffi-library]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write      # the attestation
+      attestations: write  # build provenance, so a consumer can verify where a file came from
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: {node-version: "22"}
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with: {pattern: wheel-*, path: dist, merge-multiple: true}
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with: {pattern: addon-*, path: addons}
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with: {pattern: ffi-*, path: assets, merge-multiple: true}
+      - name: Five wheels, four addons and five libraries, no more and no fewer
+        run: |
+          test "$(ls dist/*.whl | wc -l)" -eq 5
+          test "$(ls addons/*/*.node | wc -l)" -eq 4
+          test "$(ls assets/* | wc -l)" -eq 5
+      - name: Pack the four platform packages and the root package
+        run: |
+          set -euo pipefail
+          for binary in addons/*/*.node; do
+            platform="$(basename "$binary" .node)"
+            platform="${platform#packvium-native.}"
+            cp "$binary" "bindings/node/npm/$platform/"
+          done
+          mkdir -p packages
+          for directory in bindings/node/npm/*/; do
+            (cd "$directory" && npm pack --pack-destination "$GITHUB_WORKSPACE/packages")
+          done
+          (cd bindings/node && npm pack --pack-destination "$GITHUB_WORKSPACE/packages")
+          ls -l packages
+      # What a consumer gets: the root package resolving its platform package, both from the
+      # tarballs about to be published, with nothing fetched from the registry.
+      - name: A clean install of the packed root and Linux tarballs loads the addon and solves
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          echo '{"name": "consumer", "version": "1.0.0", "private": true}' > package.json
+          npm install --offline --omit=optional --no-audit --no-fund \
+            "$GITHUB_WORKSPACE/packages/packvium-native-linux-x64-gnu-$version.tgz" \
+            "$GITHUB_WORKSPACE/packages/packvium-native-$version.tgz"
+          node -e "
+            const native = require('@packvium/native');
+            const request = require('fs').readFileSync(process.argv[1], 'utf8');
+            const result = JSON.parse(native.packJson(request));
+            if (native.version() !== process.argv[2] || result.summary.packed_item_count !== 5) process.exit(1);
+            console.log('consumer install of @packvium/native ' + native.version() + ' solved the fixture');
+          " "$GITHUB_WORKSPACE/tests/fixtures/five-items.json" "$version"
+      - name: The C header and checksums travel with the libraries
+        run: |
+          cp include/packvium.h assets/
+          (cd assets && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.whl
+            packages/*.tgz
+            assets/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: {name: wheels, path: dist/*.whl}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: {name: npm-packages, path: packages/*.tgz}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: {name: release-assets, path: assets/*}
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write      # OIDC, for Trusted Publishing and PyPI's own attestations
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with: {name: wheels, path: dist}
+      # A re-run after a partial upload finishes the release instead of failing on the files
+      # already there; PyPI never lets an existing file be replaced, so nothing is overwritten.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write      # npm Trusted Publishing and provenance
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: {node-version: "22", registry-url: "https://registry.npmjs.org"}
+      # npm's OIDC trusted publishing needs npm 11.5.1 or newer; Node 22 still bundles npm 10,
+      # which performs no OIDC exchange at all. The publish then goes out unauthenticated and
+      # the registry answers `404 Not Found - PUT`, which reads exactly like a missing package
+      # rather than a missing credential.
+      - run: npm install -g npm@^11.5.1
+      - run: npm --version
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with: {name: npm-packages, path: packages}
+      # Platform packages first: the root package names them as optional dependencies, and a
+      # pin must never point at a version the registry does not serve.
+      - name: Publish the four platform packages, then the root package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          publish() {
+            if npm view "$1@$version" version >/dev/null 2>&1; then
+              echo "$1@$version is already published"
+              return
+            fi
+            npm publish "$2" --provenance --access public
+          }
+          for platform in darwin-arm64 darwin-x64 linux-x64-gnu win32-x64-msvc; do
+            publish "@packvium/native-$platform" "packages/packvium-native-$platform-$version.tgz"
+          done
+          publish "@packvium/native" "packages/packvium-native-$version.tgz"
+
+  # Every tag gets a GitHub Release: it is where the C libraries are published, and what a
+  # human and a maintenance scorer can read. It is cut whenever the build succeeded, so a
+  # registry that refuses the upload does not also withhold the libraries.
+  github-release:
+    needs: [build, publish-pypi, publish-npm]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # the Release is the only thing this workflow writes to the repository
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with: {name: release-assets, path: assets}
+      - name: Create the GitHub Release from the tag, with the C libraries attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # A re-run builds new binaries; replacing assets people may already have verified
+          # would break their checksums, so an existing Release is left exactly as it is.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; nothing to do."
+            exit 0
+          fi
+          # This version's entry, from its heading to the next one. A tag whose version has
+          # no entry would publish a Release nobody can read, so that fails the job rather
+          # than shipping an empty one.
+          awk -v want="## [$version]" '
+            index($0, want) == 1 { inside = 1; next }
+            inside && /^## /     { exit }
+            inside               { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "CHANGELOG.md carries no entry for $version" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --title "Packvium native $version" \
+            --notes-file release-notes.md \
+            --verify-tag

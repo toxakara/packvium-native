@@ -1,0 +1,31 @@
+{
+  "name": "@packvium/native-linux-x64-gnu",
+  "version": "1.8.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "packvium-native.linux-x64-gnu.node",
+  "files": [
+    "packvium-native.linux-x64-gnu.node"
+  ],
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "author": {
+    "name": "Packvium",
+    "url": "https://packvium.com"
+  },
+  "homepage": "https://packvium.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/toxakara/packvium-native.git"
+  },
+  "bugs": {
+    "url": "https://github.com/toxakara/packvium-native/issues"
+  },
+  "license": "MIT",
+  "description": "Compiled Rust engine for @packvium/engine, Linux x86_64 (glibc). Not meant to be installed directly."
+}
