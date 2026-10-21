@@ -40,11 +40,20 @@ def take(library: ctypes.CDLL, pointer: int | None) -> str:
         library.packvium_free_string(pointer)
 
 
-def without_duration(result: str) -> dict[str, object]:
-    """The result minus `algorithm.duration_ms`, the one field that measures the clock."""
-    decoded = json.loads(result)
-    del decoded["algorithm"]["duration_ms"]
-    return decoded
+def without_duration(result: str) -> object:
+    """The result minus every `duration_ms`, the one field that measures the clock.
+
+    The primary result and each of its alternatives carry one, so all are removed.
+    """
+    return _strip_durations(json.loads(result))
+
+
+def _strip_durations(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: _strip_durations(item) for key, item in value.items() if key != "duration_ms"}
+    if isinstance(value, list):
+        return [_strip_durations(item) for item in value]
+    return value
 
 
 def main(path: str) -> int:
