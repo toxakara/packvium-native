@@ -9,7 +9,7 @@ requires-python = ">=3.9"
 description = "Compiled Rust backend for Packvium, consumed by the packvium-native selector"
 readme = "README.md"
 license = "MIT"
-keywords = ["3d-bin-packing", "bin-packing", "3d-packing", "cartonization", "container-loading", "pallet-packing", "truck-loading", "packing-algorithm", "logistics", "deterministic"]
+keywords = ["3d-bin-packing", "bin-packing", "3d-packing", "cartonization", "container-loading", "pallet-packing", "truck-loading", "packing-algorithm", "logistics", "deterministic", "box-packing", "load-planning"]
 authors = [{name = "Packvium contributors"}]
 
 [project.urls]

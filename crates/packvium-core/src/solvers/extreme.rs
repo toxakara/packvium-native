@@ -574,6 +574,7 @@ pub fn find_candidates_at_points(
         )
     });
     let flat_bag = state.packed.container.is_flat_bag();
+    let axle_base = AxleBase::new(&state.packed.container, &state.packed.placements);
     let mut candidates = CandidateAccumulator::new(limit);
     for (point_index, point) in points.into_iter().enumerate() {
         if point_index > 0 && (deadline.expired() || deadline.effort_stops(request, metrics)) {
@@ -672,11 +673,10 @@ pub fn find_candidates_at_points(
             if maximum_items_reached {
                 continue;
             }
-            if axle_overloaded(
-                &state.packed.container,
-                &state.packed.placements,
-                Some((item.item.weight, envelope_box)),
-            ) {
+            if axle_base
+                .as_ref()
+                .is_some_and(|base| base.overloaded(item.item.weight, envelope_box))
+            {
                 continue;
             }
             if item.item.must_be_on_floor && point.z != 0 {
@@ -691,6 +691,7 @@ pub fn find_candidates_at_points(
                 .map(|placement| placement_support_view(&state.packed.placements, placement));
             let (support_area, support_ratio) = match nested_support.as_ref() {
                 Some(support) => (support.area, support.ratio),
+                None if point.z == 0 => (envelope.base_area(), 1.0),
                 None => {
                     let area = supporting_area(state, envelope_box);
                     (area, support_ratio_of(area, envelope_box))
@@ -1393,7 +1394,16 @@ fn commit_placement(state: &mut ContainerState, placement: Placement) {
     for point in exposed_points(state, envelope_box) {
         absorb_point(state, point);
     }
-    if let Some(loads) = calculate_top_loads(&state.packed.placements) {
+    let isolated_on_floor = envelope_box.origin.z == 0
+        && state.packed.placements[placement_index]
+            .instance
+            .item
+            .nesting_height
+            .is_none()
+        && !state.packed.placements[..placement_index]
+            .iter()
+            .any(|existing| existing.envelope_origin.z == envelope_box.z2());
+    if !isolated_on_floor && let Some(loads) = calculate_top_loads(&state.packed.placements) {
         for (placement, load) in state.packed.placements.iter_mut().zip(loads) {
             placement.top_load = Weight(load.clamp(0, i64::MAX as i128) as i64);
         }
@@ -2007,11 +2017,38 @@ impl CandidateScene<'_> {
     /// `upper`'s share of `downward` onto `lower`: proportional by contact area, with
     /// the last supporter taking the rounding remainder, exactly as the settled loads.
     fn share(&self, upper: usize, lower: usize, downward: i128) -> i128 {
-        let supporters = self.supporters(upper);
-        let total_area = supporters.iter().map(|edge| edge.area).sum::<i128>();
+        if upper == self.candidate_index() {
+            let supporters = self.below;
+            let total_area = supporters.iter().map(|edge| edge.area).sum::<i128>();
+            let mut distributed = 0_i128;
+            for (position, edge) in supporters.iter().enumerate() {
+                let share = if position + 1 == supporters.len() {
+                    downward.saturating_sub(distributed)
+                } else {
+                    downward.saturating_mul(edge.area) / total_area
+                };
+                if edge.index == lower {
+                    return share;
+                }
+                distributed = distributed.saturating_add(share);
+            }
+            return 0;
+        }
+        let base_supporters = self.sweep.graph.supporters(upper);
+        let extra = self
+            .above
+            .iter()
+            .find(|edge| edge.index == upper)
+            .map(|edge| ContactEdge {
+                index: self.candidate_index(),
+                area: edge.area,
+            });
+        let total_len = base_supporters.len() + usize::from(extra.is_some());
+        let total_area = base_supporters.iter().map(|edge| edge.area).sum::<i128>()
+            + extra.map_or(0, |edge| edge.area);
         let mut distributed = 0_i128;
-        for (position, edge) in supporters.iter().enumerate() {
-            let share = if position + 1 == supporters.len() {
+        for (position, edge) in base_supporters.iter().chain(extra.as_ref()).enumerate() {
+            let share = if position + 1 == total_len {
                 downward.saturating_sub(distributed)
             } else {
                 downward.saturating_mul(edge.area) / total_area

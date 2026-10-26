@@ -5,6 +5,7 @@ use crate::geometry::{Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::model::*;
 use crate::solver::PlacementConstraint;
 use crate::units::{Length, Weight};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -34,8 +35,8 @@ struct Block {
     ),
 }
 
-/// Lattice nodes the block start added to `fast` and `balanced` may enumerate per mode --
-/// the bound `quality` gives the same solver through `container_plan_node_limit`.
+/// Lattice nodes the block search may enumerate per mode under every profile but `quality`
+/// -- the bound `quality` gives the same solver through `container_plan_node_limit`.
 const BLOCK_START_NODE_LIMIT: usize = 100_000;
 
 /// Leading blocks the `quality` block lookahead completes in each round.
@@ -60,8 +61,26 @@ pub(crate) fn pack_homogeneous_blocks(
     constraints: &[Arc<dyn PlacementConstraint>],
     deadline: &Deadline,
 ) -> Option<PackingResult> {
-    supports(request, constraints)
-        .then(|| pack_blocks(request, items, &[COUNT_FIRST, VOLUME_FIRST], deadline))
+    supports(request, constraints).then(|| {
+        pack_blocks(
+            &with_block_node_limit(request),
+            items,
+            &[COUNT_FIRST, VOLUME_FIRST],
+            deadline,
+        )
+    })
+}
+
+/// The request the block search runs. Every profile but `quality` leaves
+/// `container_plan_node_limit` at one, which would stop the enumeration before its first
+/// block, so under them the search carries its own bound. O(n) for the copy.
+fn with_block_node_limit(request: &PackingRequest) -> Cow<'_, PackingRequest> {
+    if request.config.profile == SolverProfile::Quality {
+        return Cow::Borrowed(request);
+    }
+    let mut bounded = request.clone();
+    bounded.config.container_plan_node_limit = BLOCK_START_NODE_LIMIT;
+    Cow::Owned(bounded)
 }
 
 /// Whether the lattice can express the whole request as the one block start `fast` and
@@ -83,20 +102,17 @@ pub(crate) fn supports_block_start(
 /// The block start `fast` and `balanced` add to their own; the caller has already
 /// established [`supports_block_start`].
 ///
-/// Those profiles leave `container_plan_node_limit` at one, which would stop the
-/// enumeration before its first block, so the start carries its own bound. `fast` is
-/// latency-bound and enumerates one mode, the one its objective ranks by; `balanced`
-/// enumerates both, as `quality` does. Same O(B*S*T*R*X*Y) time and O(S+n) space as
+/// Those profiles leave `container_plan_node_limit` at one, so the start carries its own
+/// bound ([`with_block_node_limit`]). `fast` is latency-bound and enumerates one mode,
+/// the one its objective ranks by; `balanced` enumerates both, as `quality` does. Same O(B*S*T*R*X*Y) time and O(S+n) space as
 /// [`pack_homogeneous_blocks`], with X*Y capped at `BLOCK_START_NODE_LIMIT` per mode.
 pub(crate) fn pack_block_start(
     request: &PackingRequest,
     items: &[ItemInstance],
     deadline: &Deadline,
 ) -> PackingResult {
-    let mut bounded = request.clone();
-    bounded.config.container_plan_node_limit = BLOCK_START_NODE_LIMIT;
     pack_blocks(
-        &bounded,
+        &with_block_node_limit(request),
         items,
         block_start_modes(&request.config),
         deadline,
@@ -1044,6 +1060,44 @@ mod tests {
             ],
             "containers": [{"id":"box","quantity":1,"inner_dimensions":{"length":"300","width":"200","height":"200"},"max_payload":{"value":"1000","unit":"g"}}]
         }).to_string()
+    }
+
+    /// The cartons of [`request`] under `profile`, at that profile's own node limit unless
+    /// one is given.
+    fn named_blocks(profile: &str, node_limit: Option<usize>) -> serde_json::Value {
+        let mut request: serde_json::Value = serde_json::from_str(&request(1, true)).unwrap();
+        let configuration = &mut request["configuration"];
+        configuration["solver_profile"] = profile.into();
+        configuration["container_plan_beam_width"] = 1.into();
+        match node_limit {
+            Some(limit) => configuration["container_plan_node_limit"] = limit.into(),
+            None => {
+                configuration
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("container_plan_node_limit");
+            }
+        }
+        serde_json::from_str(&pack_json(&request.to_string()).expect("solve")).unwrap()
+    }
+
+    #[test]
+    fn a_named_block_solver_outside_quality_reaches_its_first_block() {
+        // Both profiles leave `container_plan_node_limit` at one, short of the first block
+        //.
+        for profile in ["fast", "balanced"] {
+            let result = named_blocks(profile, None);
+            assert_eq!(result["summary"]["packed_item_count"], 28, "{profile}");
+            assert_eq!(result["termination"]["code"], "complete", "{profile}");
+        }
+    }
+
+    #[test]
+    fn a_node_limit_stop_is_the_search_answer_not_a_time_limit() {
+        let result = named_blocks("quality", Some(1));
+        assert_eq!(result["summary"]["packed_item_count"], 0);
+        assert_eq!(result["algorithm"]["time_limit_reached"], false);
+        assert_eq!(result["termination"]["code"], "complete");
     }
 
     /// One 60x60x40 base and three 40x60x50 tops in a 100 mm crate. The greedy block pass,

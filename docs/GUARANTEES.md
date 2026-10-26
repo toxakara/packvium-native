@@ -14,8 +14,11 @@ After a result reports `feasible` or `optimal` and passes independent validation
 - **exact arithmetic** — all geometry is integer, in units of 1/16000 mm for length and
   1/8 µg for weight. No coordinate is ever a binary floating-point number, so no
   placement decision depends on rounding;
-- **determinism** — identical input and identical seed produce an identical result, on
-  any platform, when the search completes or stops on `configuration.effort_budget`. A
+- **determinism** — for a fixed backend and version, identical input and seed produce
+  identical packing and deterministic diagnostics on supported platforms when the search
+  completes or stops on `configuration.effort_budget`. Wall-clock timing diagnostics,
+  such as `duration_ms` and `elapsed_ms`, are excluded. This does not promise identical
+  solutions between backends; their documented native quality differences remain. A
   search stopped by `time_limit_ms` stops where the host's speed let it, so it may differ
   between runs; the result says which limit stopped it;
 - **complete accounting** — every requested item instance appears exactly once, either

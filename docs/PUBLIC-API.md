@@ -755,3 +755,11 @@ depend on the exact shape.
 Python, PHP, Rust and the JavaScript fallback accept the same top-level keys: `units`,
 `configuration`, `items`, `containers`, `catalog_versions_used`, `policy`, `output` and
 `fixed_placements`.
+
+`units` holds one key, `length`: the unit of every length written without one, millimetres when
+`units`, or `units.length`, is absent or `null`. There is no request-wide weight unit. A weight
+takes its unit from the measure itself (`"2.5 kg"`, `{"value": "2.5", "unit": "kg"}`), and a
+bare number is grams. `units.weight` is not a field: today every engine ignores it without an
+error, so `{"length": "cm", "weight": "kg"}` still reads a bare weight `2` as 2 g. Write the unit
+on each weight instead. A future release that changes the request schema will refuse unknown
+keys in `units`, as it already refuses them in `configuration`.

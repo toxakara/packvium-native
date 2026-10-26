@@ -26,6 +26,8 @@
     "truck-loading",
     "packing-algorithm",
     "logistics",
-    "deterministic"
+    "deterministic",
+    "box-packing",
+    "load-planning"
   ]
 }
