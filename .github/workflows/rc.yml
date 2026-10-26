@@ -1,0 +1,47 @@
+name: rc
+
+# A pre-release tag (`v1.9.0-rc.1`) is checked against every version this repository
+# declares and its changelog, exactly as `release.yml` does, and nothing is built or
+# published. The native packages (`packvium-native-rust` on PyPI, `@packvium/native*` on
+# npm) are not yet published to production at all; an RC channel for them is added in the
+# change that gives them their production Trusted Publishers. There is no GitHub Release.
+
+on:
+  push:
+    tags: ["v*-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The tag and every packaged version must agree. Without this, `git tag v0.2.0` on a
+      # tree that still says 0.1.0 publishes 0.1.0 under a name that claims otherwise, and the
+      # mistake is only visible after it is public and immutable.
+      - name: The tag must match every version this repository publishes
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" <<'PY'
+          import json, sys, tomllib
+          from pathlib import Path
+          tagged = sys.argv[1]
+          versions = {
+              "Cargo.toml": tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]["version"],
+              "bindings/python/pyproject.toml": tomllib.loads(Path("bindings/python/pyproject.toml").read_text())["project"]["version"],
+          }
+          for manifest in ["bindings/node/package.json", *map(str, sorted(Path("bindings/node/npm").glob("*/package.json")))]:
+              versions[manifest] = json.loads(Path(manifest).read_text())["version"]
+          wrong = {path: found for path, found in versions.items() if found != tagged}
+          for path, found in wrong.items():
+              print(f"{path} declares {found}, the tag says {tagged}", file=sys.stderr)
+          raise SystemExit(1 if wrong else 0)
+          PY
+      - name: The tag must have a changelog entry
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## \[${tagged}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## [${tagged}]' section for tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
