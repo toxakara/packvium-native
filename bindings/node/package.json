@@ -1,6 +1,6 @@
 {
   "name": "@packvium/native",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Compiled Rust engine for @packvium/engine. Not meant to be installed directly.",
   "license": "MIT",
   "main": "index.js",
@@ -31,9 +31,9 @@
     "url": "https://github.com/toxakara/packvium-native/issues"
   },
   "optionalDependencies": {
-    "@packvium/native-darwin-arm64": "1.8.0",
-    "@packvium/native-darwin-x64": "1.8.0",
-    "@packvium/native-win32-x64-msvc": "1.8.0",
-    "@packvium/native-linux-x64-gnu": "1.8.0"
+    "@packvium/native-darwin-arm64": "1.9.0",
+    "@packvium/native-darwin-x64": "1.9.0",
+    "@packvium/native-win32-x64-msvc": "1.9.0",
+    "@packvium/native-linux-x64-gnu": "1.9.0"
   }
 }

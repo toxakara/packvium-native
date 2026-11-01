@@ -17,7 +17,7 @@ jobs:
   verify-tag:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The tag and every packaged version must agree. Without this, `git tag v0.2.0` on a
       # tree that still says 0.1.0 publishes 0.1.0 under a name that claims otherwise, and the
       # mistake is only visible after it is public and immutable.
