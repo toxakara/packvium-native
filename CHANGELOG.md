@@ -5,6 +5,12 @@ PyPI, `@packvium/native` and its platform packages on npm, and the C library on 
 Releases. The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0]
+
+The compiled engines rebuilt on the 1.9.0 core: the centre of gravity is checked under a support
+ratio, a length past `2^53 - 1` ticks or an empty side is refused with a pointer, nesting under a
+clearance agrees with the other engines, and `exact_small` is 9-28% faster where it runs.
+
 ## [1.8.0]
 
 The first release of the compiled engines. Each binary is built from the Rust source in this

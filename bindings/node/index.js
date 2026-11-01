@@ -13,7 +13,7 @@
 'use strict';
 
 /** The release this loader belongs to; a binary from any other release is refused. */
-const EXPECTED_VERSION = '1.8.0';
+const EXPECTED_VERSION = '1.9.0';
 
 function firstLoadable(attempts) {
   const failures = [];
