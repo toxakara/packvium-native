@@ -18,9 +18,11 @@ FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "five-items.json"
 
 
 def without_duration(result: str) -> dict[str, object]:
-    """The result minus `algorithm.duration_ms`, the one field that measures the clock."""
+    """The result minus `algorithm.duration_ms`, the one field that measures the clock, in the
+    winner and in every alternative: each alternative is a whole result with its own timer."""
     decoded = json.loads(result)
-    del decoded["algorithm"]["duration_ms"]
+    for answer in (decoded, *decoded.get("alternatives", ())):
+        del answer["algorithm"]["duration_ms"]
     return decoded
 
 
