@@ -43,10 +43,11 @@ check('it packs every item and the answer passes the reference validator', () =>
   assert.deepEqual(JSON.parse(native.validateJson(request, result)), { issues: [] });
 });
 
-/** The result minus `algorithm.duration_ms`, the one field that measures the clock. */
+/** The result minus `algorithm.duration_ms`, the one field that measures the clock, in the
+ *  winner and in every alternative: each alternative is a whole result with its own timer. */
 const withoutDuration = (result) => {
   const decoded = JSON.parse(result);
-  delete decoded.algorithm.duration_ms;
+  for (const answer of [decoded, ...(decoded.alternatives ?? [])]) delete answer.algorithm.duration_ms;
   return decoded;
 };
 

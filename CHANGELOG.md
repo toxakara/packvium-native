@@ -5,6 +5,16 @@ PyPI, `@packvium/native` and its platform packages on npm, and the C library on 
 Releases. The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0]
+
+The compiled engines rebuilt on the 1.10.0 core: a pallet load may overhang its deck,
+`gusseted_bag` joins the flat bag, a convex hull turns 24 ways, every placement carries a
+`placement_id`, a request may declare its `currency`, and `maximum_value`,
+`open_dimension_height` and `maximum_volume` state a lower bound. `units` now refuses every key
+but `length`, and the grid lattice and block loader number containers per type (`large#1`, not
+`large#10`). The Node addon is built with napi 3.16. The wheel and addon tests mask
+`duration_ms` in every alternative, not only the answer.
+
 ## [1.9.0]
 
 The compiled engines rebuilt on the 1.9.0 core: the centre of gravity is checked under a support
